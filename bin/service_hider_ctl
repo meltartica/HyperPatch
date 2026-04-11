@@ -307,21 +307,8 @@ load_uid_map() {
 
 get_uid_from_map() {
     pkg="$1"
-    if [ -z "$UID_MAP" ]; then
-        echo ""
-        return
-    fi
-    
-    # Pure native shell hashmap lookup using string manipulation
-    nl=""
-    search_map="${nl}${UID_MAP}"
-    rem="${search_map#*${nl}${pkg}=}"
-    
-    if [ "$rem" != "$search_map" ]; then
-        echo "${rem%%${nl}*}"
-    else
-        echo ""
-    fi
+    [ -z "$UID_MAP" ] && return
+    printf '%s\n' "$UID_MAP" | grep "^${pkg}=" | cut -d= -f2
 }
 
 get_uid() {
@@ -518,6 +505,7 @@ restore_rules() {
             continue
         fi
 
+        endpoint="$RULE_IP:$RULE_PORT"
         printf '%s\n' "$endpoint" >> "$reject_seen"
 
         if rule_targets_loopback_v6 "$RULE_IP"; then
