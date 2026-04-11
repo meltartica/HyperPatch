@@ -146,16 +146,21 @@ run_with_lock() {
 }
 
 is_valid_ipv4() {
-    echo "$1" | awk -F'.' '
-        NF != 4 { exit 1 }
-        {
-            for (i = 1; i <= 4; i++) {
-                if ($i !~ /^[0-9]+$/) exit 1
-                if ($i < 0 || $i > 255) exit 1
-            }
-            exit 0
-        }
-    ' >/dev/null 2>&1
+    ip="$1"
+    rem="$ip"
+    a="${rem%%.*}"; rem="${rem#*.}"
+    b="${rem%%.*}"; rem="${rem#*.}"
+    c="${rem%%.*}"; d="${rem#*.}"
+    
+    case "$d" in *.*) return 1 ;; esac
+    
+    for i in "$a" "$b" "$c" "$d"; do
+        case "$i" in
+            '' | *[!0-9]*) return 1 ;;
+        esac
+        [ "$i" -le 255 ] 2>/dev/null || return 1
+    done
+    return 0
 }
 
 is_valid_ipv4_or_cidr() {
@@ -190,8 +195,10 @@ is_valid_port() {
 }
 
 trim_field() {
-    # Normalize CRLF and strip surrounding whitespace.
-    printf '%s' "$1" | sed 's/\r$//;s/^[[:space:]]*//;s/[[:space:]]*$//'
+    # Native shell word-splitting instantly drops leading/trailing spaces without spawning computationally expensive 'sed' forks.
+    t="${1%"$(printf '\r')"}"
+    set -- $t
+    printf '%s' "$*"
 }
 
 parse_rule_line() {
@@ -291,7 +298,11 @@ rule_targets_loopback_v6() {
 }
 
 load_uid_map() {
-    UID_MAP="$(pm list packages -U 2>/dev/null | sed -n 's/^package:\([^ ]*\) uid:\([0-9]*\)$/\1=\2/p')"
+    if [ -r /data/system/packages.list ]; then
+        UID_MAP="$(awk '{print $1"="$2}' /data/system/packages.list)"
+    else
+        UID_MAP="$(pm list packages -U 2>/dev/null | sed -n 's/^package:\([^ ]*\) uid:\([0-9]*\)$/\1=\2/p')"
+    fi
 }
 
 get_uid_from_map() {
@@ -300,12 +311,25 @@ get_uid_from_map() {
         echo ""
         return
     fi
-    printf '%s\n' "$UID_MAP" | awk -F'=' -v k="$pkg" '$1 == k { print $2; exit }'
+    
+    # Pure native shell hashmap lookup using string manipulation
+    nl=""
+    search_map="${nl}${UID_MAP}"
+    rem="${search_map#*${nl}${pkg}=}"
+    
+    if [ "$rem" != "$search_map" ]; then
+        echo "${rem%%${nl}*}"
+    else
+        echo ""
+    fi
 }
 
 get_uid() {
-    uid=$(pm list packages -U 2>/dev/null | grep -F "package:$1 " | sed -n 's/.*uid:\([0-9]*\).*/\1/p')
-    echo "$uid"
+    if [ -r /data/system/packages.list ]; then
+        awk -v pkg="$1" '$1 == pkg { print $2; exit }' /data/system/packages.list
+    else
+        pm list packages -U 2>/dev/null | grep -F "package:$1 " | sed -n 's/.*uid:\([0-9]*\).*/\1/p'
+    fi
 }
 
 add_rule() {
@@ -494,16 +518,10 @@ restore_rules() {
             continue
         fi
 
-        endpoint="$RULE_IP:$RULE_PORT"
-        if ! grep -Fxq "$endpoint" "$reject_seen" 2>/dev/null; then
-            printf '%s\n' "$endpoint" >> "$reject_seen"
-        fi
+        printf '%s\n' "$endpoint" >> "$reject_seen"
 
         if rule_targets_loopback_v6 "$RULE_IP"; then
-            endpoint_v6="::1:$RULE_PORT"
-            if ! grep -Fxq "$endpoint_v6" "$reject_seen_v6" 2>/dev/null; then
-                printf '%s\n' "$endpoint_v6" >> "$reject_seen_v6"
-            fi
+            printf '%s\n' "::1:$RULE_PORT" >> "$reject_seen_v6"
         fi
 
         uid=$(get_uid_from_map "$RULE_PKG")
@@ -539,6 +557,11 @@ restore_rules() {
             fi
         fi
     done < "$CONFIG"
+    
+    # Bulk deduplicate entirely eliminating grep sub forks
+    sort -u "$reject_seen" > "${reject_seen}.tmp" 2>/dev/null && mv "${reject_seen}.tmp" "$reject_seen" 2>/dev/null
+    sort -u "$reject_seen_v6" > "${reject_seen_v6}.tmp" 2>/dev/null && mv "${reject_seen_v6}.tmp" "$reject_seen_v6" 2>/dev/null
+
     while IFS= read -r endpoint; do
         [ -n "$endpoint" ] || continue
         ip="${endpoint%:*}"

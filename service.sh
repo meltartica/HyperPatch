@@ -42,19 +42,44 @@ collect_udc_state_files() {
 }
 
 set_adb_state() {
-    # $1 = 1 (enable) or 0 (disable)
+    # Expects $current, $adbd_state, $sys_usb_config to be pre-populated
     if [ "$1" = "1" ]; then
-        settings put global adb_enabled 1
-        setprop persist.sys.usb.config mtp,adb
-        setprop sys.usb.config mtp,adb
-        setprop ctl.restart adbd
+        [ "$current" = "1" ] || settings put global adb_enabled 1
+
+        config_changed=0
+        if ! printf '%s' "$sys_usb_config" | grep -q 'adb'; then
+            if [ -n "$sys_usb_config" ] && [ "$sys_usb_config" != "none" ]; then
+                new_config="${sys_usb_config},adb"
+            else
+                new_config="mtp,adb"
+            fi
+            setprop persist.sys.usb.config "$new_config"
+            setprop sys.usb.config "$new_config"
+            config_changed=1
+        fi
+
+        if [ "$adbd_state" != "running" ]; then
+            setprop ctl.start adbd
+        elif [ "$config_changed" = "1" ]; then
+            setprop ctl.restart adbd
+        fi
+
         last_adb_state="1"
         echo "Auto-ADB: PC Connected, enabling..."
     else
-        settings put global adb_enabled 0
-        setprop persist.sys.usb.config mtp
-        setprop sys.usb.config mtp
-        setprop ctl.stop adbd
+        [ "$current" = "0" ] || settings put global adb_enabled 0
+
+        if printf '%s' "$sys_usb_config" | grep -q 'adb'; then
+            # Safely strip adb to preserve existing tethering/MIDI modes
+            new_config="$(printf '%s' "$sys_usb_config" | sed 's/,adb//; s/adb,//; s/adb/mtp/')"
+            [ -z "$new_config" ] && new_config="mtp"
+            
+            setprop persist.sys.usb.config "$new_config"
+            setprop sys.usb.config "$new_config"
+        fi
+
+        [ "$adbd_state" = "stopped" ] || setprop ctl.stop adbd
+
         last_adb_state="0"
         echo "Auto-ADB: PC Disconnected, disabling..."
     fi
@@ -62,13 +87,7 @@ set_adb_state() {
 
 # Apply desired ADB state only when USB connection state changes.
 reconcile_state() {
-    if get_usb_connected; then
-        usb_state=1
-        desired=1
-    else
-        usb_state=0
-        desired=0
-    fi
+    get_usb_connected && usb_state=1 || usb_state=0
 
     [ "$usb_state" = "$last_usb_state" ] && return
 
@@ -77,7 +96,7 @@ reconcile_state() {
     sys_usb_config="$(getprop sys.usb.config 2>/dev/null)"
 
     runtime_ok=0
-    if [ "$desired" = "1" ]; then
+    if [ "$usb_state" = "1" ]; then
         if [ "$current" = "1" ] && [ "$adbd_state" = "running" ] && printf '%s' "$sys_usb_config" | grep -q 'adb'; then
             runtime_ok=1
         fi
@@ -93,8 +112,8 @@ reconcile_state() {
         return
     fi
 
-    if [ "$last_adb_state" != "$desired" ] || [ "$current" != "$desired" ]; then
-        set_adb_state "$desired"
+    if [ "$last_adb_state" != "$usb_state" ] || [ "$current" != "$usb_state" ]; then
+        set_adb_state "$usb_state"
     fi
 
     last_usb_state="$usb_state"
@@ -118,9 +137,19 @@ event_loop_inotifyd() {
 
         # shellcheck disable=SC2086
         inotifyd - $watch_specs 2>/dev/null | while IFS= read -r _line; do
-            # Let sysfs state settle before reconciling.
-            sleep 2
-            reconcile_state
+            # Peek current state to avoid lag accumulation from multiple quick events
+            if get_usb_connected; then
+                current_usb=1
+            else
+                current_usb=0
+            fi
+
+            # Only delay and reconcile if the raw state differs from what we last handled
+            if [ "$current_usb" != "$last_usb_state" ]; then
+                # Let sysfs state settle before reconciling.
+                sleep 2
+                reconcile_state
+            fi
         done
 
         # Watcher exited (device tree changed/unwatchable/etc); restart watch set.

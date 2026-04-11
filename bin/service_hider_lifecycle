@@ -39,11 +39,9 @@ rotate_log() {
 
     max_size=$((512 * 1024))
     if [ "$size" -ge "$max_size" ]; then
-        ts="$(date '+%Y%m%d_%H%M%S' 2>/dev/null)"
-        [ -n "$ts" ] || ts="rotated"
-        mv "$LOG_FILE" "${LOG_FILE}.${ts}" 2>/dev/null
-
-        find "${LOG_FILE%/*}" -name "${LOG_FILE##*/}.*" -type f 2>/dev/null | sort -r | tail -n +3 | xargs rm -f 2>/dev/null
+        # Native O(1) unix log rolling to keep exactly 2 backups natively without spawning heavy find/sort/xargs pipelines
+        mv -f "${LOG_FILE}.1" "${LOG_FILE}.2" 2>/dev/null
+        mv -f "$LOG_FILE" "${LOG_FILE}.1" 2>/dev/null
     fi
 }
 
@@ -90,6 +88,15 @@ file_signature() {
     if [ ! -f "$target" ]; then
         echo "missing"
         return
+    fi
+
+    # Fast O(1) attribute check - instead of heavily hashing a 5MB+ XML file
+    if command -v stat >/dev/null 2>&1; then
+        out="$(stat -c "%Y:%s" "$target" 2>/dev/null)"
+        if [ -n "$out" ]; then
+            echo "$out"
+            return
+        fi
     fi
 
     if command -v cksum >/dev/null 2>&1; then
