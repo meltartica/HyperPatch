@@ -1,0 +1,8 @@
+# Disable Rescue Party Plus（防止应用闪退概率被清空数据）
+persist.sys.rescuepartyplus.disable=1
+
+# Force Enable 1Hz Refresh Rate for AOD (强制启用AOD的1Hz刷新率)
+ro.vendor.mi_sf.aod_mode_ddic_refresh_rate=1
+
+# Disable Preloading Applications (禁用应用预加载)
+# persist.sys.prestart.proc=false

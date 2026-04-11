@@ -1,0 +1,838 @@
+#!/system/bin/sh
+
+SELF_PATH="$(readlink -f "$0" 2>/dev/null)"
+[ -n "$SELF_PATH" ] || SELF_PATH="$0"
+case "$SELF_PATH" in
+    /*) ;;
+    *) SELF_PATH="$(pwd)/$SELF_PATH" ;;
+esac
+SCRIPT_DIR=${SELF_PATH%/*}
+MODDIR=${SCRIPT_DIR%/*}
+CONFIG=${MODDIR}/rules.conf
+CHAIN_NAME="SERVICE_HIDER"
+WATCHER_PID_FILE="${MODDIR}/.shw.pid"
+UID_MAP=""
+LOCKDIR="${MODDIR}/.service_hider_lock"
+IPTABLES_WAIT=0
+IPTABLES6_WAIT=0
+
+init_iptables_mode() {
+    if iptables -w -L OUTPUT -n >/dev/null 2>&1; then
+        IPTABLES_WAIT=1
+    fi
+}
+
+ipt() {
+    if [ "$IPTABLES_WAIT" = "1" ]; then
+        iptables -w "$@"
+    else
+        iptables "$@"
+    fi
+}
+
+init_ip6tables_mode() {
+    if command -v ip6tables >/dev/null 2>&1 && ip6tables -w -L OUTPUT -n >/dev/null 2>&1; then
+        IPTABLES6_WAIT=1
+    fi
+}
+
+ip6t() {
+    if [ "$IPTABLES6_WAIT" = "1" ]; then
+        ip6tables -w "$@"
+    else
+        ip6tables "$@"
+    fi
+}
+
+acquire_lock() {
+    attempts=0
+    while ! mkdir "$LOCKDIR" 2>/dev/null; do
+        if [ -f "${LOCKDIR}/pid" ]; then
+            lock_pid="$(cat "${LOCKDIR}/pid" 2>/dev/null)"
+            if [ -n "$lock_pid" ] && ! kill -0 "$lock_pid" 2>/dev/null; then
+                rm -f "${LOCKDIR}/pid" 2>/dev/null
+                rmdir "$LOCKDIR" 2>/dev/null
+                continue
+            fi
+        fi
+        attempts=$((attempts + 1))
+        if [ "$attempts" -ge 30 ]; then
+            echo "ServiceHider busy; try again."
+            return 1
+        fi
+        sleep 1
+    done
+    echo "$$" > "${LOCKDIR}/pid" 2>/dev/null
+    return 0
+}
+
+release_lock() {
+    rm -f "${LOCKDIR}/pid" 2>/dev/null
+    rmdir "$LOCKDIR" 2>/dev/null
+}
+
+make_tmpfile() {
+    label="$1"
+    tmp="$(mktemp 2>/dev/null)"
+    if [ -n "$tmp" ]; then
+        printf '%s\n' "$tmp"
+        return 0
+    fi
+
+    ts="$(date +%s 2>/dev/null)"
+    [ -n "$ts" ] || ts="0"
+    tmp="${MODDIR}/.${label}.$$.$ts.tmp"
+    : > "$tmp" 2>/dev/null || return 1
+    printf '%s\n' "$tmp"
+    return 0
+}
+
+append_rule_atomic() {
+    line="$1"
+    tmpfile="$(make_tmpfile addrule)"
+    if [ -z "$tmpfile" ]; then
+        echo "Failed to create temp file" >&2
+        return 1
+    fi
+
+    if [ -f "$CONFIG" ]; then
+        cat "$CONFIG" > "$tmpfile" 2>/dev/null || {
+            rm -f "$tmpfile" 2>/dev/null
+            echo "Failed to stage existing config" >&2
+            return 1
+        }
+    fi
+
+    printf '%s\n\n' "$line" >> "$tmpfile" || {
+        rm -f "$tmpfile" 2>/dev/null
+        echo "Failed to write staged config" >&2
+        return 1
+    }
+
+    mv "$tmpfile" "$CONFIG" 2>/dev/null || {
+        rm -f "$tmpfile" 2>/dev/null
+        echo "Failed to commit config update" >&2
+        return 1
+    }
+    return 0
+}
+
+run_with_retry() {
+    tries=0
+    while true; do
+        "$@"
+        rc=$?
+        if [ "$rc" -eq 0 ]; then
+            return 0
+        fi
+
+        tries=$((tries + 1))
+        if [ "$tries" -ge 3 ]; then
+            return "$rc"
+        fi
+
+        sleep "$tries"
+    done
+}
+
+run_with_lock() {
+    acquire_lock || return 1
+    trap 'release_lock' EXIT INT TERM
+    "$@"
+    status=$?
+    trap - EXIT INT TERM
+    release_lock
+    return "$status"
+}
+
+is_valid_ipv4() {
+    echo "$1" | awk -F'.' '
+        NF != 4 { exit 1 }
+        {
+            for (i = 1; i <= 4; i++) {
+                if ($i !~ /^[0-9]+$/) exit 1
+                if ($i < 0 || $i > 255) exit 1
+            }
+            exit 0
+        }
+    ' >/dev/null 2>&1
+}
+
+is_valid_ipv4_or_cidr() {
+    ip="$1"
+    case "$ip" in
+        */*)
+            cidr="${ip##*/}"
+            ip="${ip%/*}"
+            case "$cidr" in
+                ''|*[!0-9]*) return 1 ;;
+            esac
+            [ "$cidr" -ge 0 ] && [ "$cidr" -le 32 ] || return 1
+            ;;
+    esac
+    is_valid_ipv4 "$ip"
+}
+
+is_valid_proto() {
+    case "$1" in
+        tcp|udp|both) return 0 ;;
+    esac
+    return 1
+}
+
+is_valid_port() {
+    case "$1" in
+        ''|*[!0-9]*)
+            return 1
+            ;;
+    esac
+    [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
+}
+
+trim_field() {
+    # Normalize CRLF and strip surrounding whitespace.
+    printf '%s' "$1" | sed 's/\r$//;s/^[[:space:]]*//;s/[[:space:]]*$//'
+}
+
+parse_rule_line() {
+    line="$(trim_field "$1")"
+    RULE_PKG=""
+    RULE_IP=""
+    RULE_PORT=""
+    RULE_PROTO="tcp"
+
+    case "$line" in
+        ""|\#*)
+            return 1
+            ;;
+        *"|"*)
+            RULE_PKG="${line%%|*}"
+            rem="${line#*|}"
+            RULE_IP="${rem%%|*}"
+            RULE_PORT="${rem#*|}"
+            ;;
+        *,*:* )
+            RULE_PKG="${line%%,*}"
+            hostport="${line#*,}"
+            proto_candidate="${hostport##*:}"
+            case "$proto_candidate" in
+                tcp|udp|both)
+                    RULE_PROTO="$proto_candidate"
+                    hostport_no_proto="${hostport%:*}"
+                    RULE_PORT="${hostport_no_proto##*:}"
+                    RULE_IP="${hostport_no_proto%:*}"
+                    ;;
+                *)
+                    RULE_PORT="$proto_candidate"
+                    RULE_IP="${hostport%:*}"
+                    RULE_PROTO="tcp"
+                    ;;
+            esac
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+
+    RULE_PKG="$(trim_field "$RULE_PKG")"
+    RULE_IP="$(trim_field "$RULE_IP")"
+    RULE_PORT="$(trim_field "$RULE_PORT")"
+    RULE_PROTO="$(trim_field "$RULE_PROTO")"
+
+    [ -n "$RULE_PKG" ] || return 1
+    [ -n "$RULE_IP" ] || return 1
+    [ -n "$RULE_PORT" ] || return 1
+    is_valid_ipv4_or_cidr "$RULE_IP" || return 1
+    is_valid_port "$RULE_PORT" || return 1
+    is_valid_proto "$RULE_PROTO" || return 1
+    return 0
+}
+
+format_rule() {
+    pkg="$1"
+    ip="$2"
+    port="$3"
+    proto="${4:-tcp}"
+    if [ "$proto" = "tcp" ]; then
+        printf "%s,%s:%s" "$pkg" "$ip" "$port"
+    else
+        printf "%s,%s:%s:%s" "$pkg" "$ip" "$port" "$proto"
+    fi
+}
+
+init_chain() {
+    if ! ipt -L "$CHAIN_NAME" -n >/dev/null 2>&1; then
+        ipt -N "$CHAIN_NAME"
+    fi
+
+    while ipt -D OUTPUT -j "$CHAIN_NAME" >/dev/null 2>&1; do
+        :
+    done
+    ipt -I OUTPUT 1 -j "$CHAIN_NAME"
+
+    if command -v ip6tables >/dev/null 2>&1; then
+        if ! ip6t -L "$CHAIN_NAME" -n >/dev/null 2>&1; then
+            ip6t -N "$CHAIN_NAME"
+        fi
+        while ip6t -D OUTPUT -j "$CHAIN_NAME" >/dev/null 2>&1; do
+            :
+        done
+        ip6t -I OUTPUT 1 -j "$CHAIN_NAME"
+    fi
+}
+
+rule_targets_loopback_v6() {
+    case "$1" in
+        127.*)
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+load_uid_map() {
+    UID_MAP="$(pm list packages -U 2>/dev/null | sed -n 's/^package:\([^ ]*\) uid:\([0-9]*\)$/\1=\2/p')"
+}
+
+get_uid_from_map() {
+    pkg="$1"
+    if [ -z "$UID_MAP" ]; then
+        echo ""
+        return
+    fi
+    printf '%s\n' "$UID_MAP" | awk -F'=' -v k="$pkg" '$1 == k { print $2; exit }'
+}
+
+get_uid() {
+    uid=$(pm list packages -U 2>/dev/null | grep -F "package:$1 " | sed -n 's/.*uid:\([0-9]*\).*/\1/p')
+    echo "$uid"
+}
+
+add_rule() {
+    pkg=$1
+    ip=$2
+    port=$3
+    section="${4:-whitelist}"
+
+    if [ -z "$pkg" ]; then
+        echo "Package is required"
+        return 1
+    fi
+    if ! is_valid_ipv4 "$ip"; then
+        echo "Invalid IP: $ip"
+        return 1
+    fi
+    if ! is_valid_port "$port"; then
+        echo "Invalid port: $port"
+        return 1
+    fi
+    case "$section" in
+        whitelist|blacklist) ;;
+        *)
+            echo "Invalid section: $section (use 'whitelist' or 'blacklist')"
+            return 1
+            ;;
+    esac
+
+    [ -f "$CONFIG" ] || { echo "[whitelist]" > "$CONFIG"; }
+
+    line="$(format_rule "$pkg" "$ip" "$port")"
+    if grep -Fxq "$line" "$CONFIG" 2>/dev/null; then
+        echo "Already exists: $pkg"
+        return 0
+    fi
+
+    load_uid_map
+    if [ -z "$(get_uid_from_map "$pkg")" ]; then
+        echo "Package $pkg not found"
+        return 1
+    fi
+
+    if grep -Fxq "[\n$section\n]" "$CONFIG" 2>/dev/null || grep -Fxq "[$section]" "$CONFIG" 2>/dev/null; then
+        tmpfile="$(make_tmpfile addsect)"
+        if [ -z "$tmpfile" ]; then
+            echo "Failed to create temp file"
+            return 1
+        fi
+
+        inserted=0
+        while IFS= read -r cfgline; do
+            printf '%s\n' "$cfgline" >> "$tmpfile"
+            if [ "$inserted" -eq 0 ] && [ "$(trim_field "$cfgline")" = "[$section]" ]; then
+                printf '%s\n' "$line" >> "$tmpfile"
+                inserted=1
+            fi
+        done < "$CONFIG"
+
+        if [ "$inserted" -eq 0 ]; then
+            printf '%s\n' "" >> "$tmpfile"
+            printf '%s\n' "[$section]" >> "$tmpfile"
+            printf '%s\n' "$line" >> "$tmpfile"
+        fi
+
+        if ! mv "$tmpfile" "$CONFIG" 2>/dev/null; then
+            rm -f "$tmpfile" 2>/dev/null
+            return 1
+        fi
+    else
+        printf '%s\n' "" >> "$CONFIG"
+        printf '%s\n' "[$section]" >> "$CONFIG"
+        printf '%s\n' "$line" >> "$CONFIG"
+    fi
+
+    restore_rules
+    echo "Added: $pkg to $section"
+}
+
+del_rule() {
+    pkg=$1
+    ip=$2
+    port=$3
+
+    if [ -z "$pkg" ] || ! is_valid_ipv4 "$ip" || ! is_valid_port "$port"; then
+        echo "Usage: del <package> <ip> <port>"
+        return 1
+    fi
+
+    if [ -f "$CONFIG" ]; then
+        tmpfile="$(make_tmpfile delrule)"
+        if [ -z "$tmpfile" ]; then
+            echo "Failed to create temp file"
+            return 1
+        fi
+        while IFS= read -r line; do
+            trimmed="$(trim_field "$line")"
+            if ! parse_rule_line "$line"; then
+                case "$trimmed" in
+                    "")
+                        ;;
+                    "[whitelist]"|"[blacklist]")
+                        printf '%s\n' "$trimmed" >> "$tmpfile"
+                        ;;
+                    "#"*)
+                        printf '%s\n' "$line" >> "$tmpfile"
+                        ;;
+                esac
+                continue
+            fi
+
+            if [ "$RULE_PKG" = "$pkg" ] && [ "$RULE_IP" = "$ip" ] && [ "$RULE_PORT" = "$port" ]; then
+                continue
+            fi
+
+            printf '%s\n' "$(format_rule "$RULE_PKG" "$RULE_IP" "$RULE_PORT")" >> "$tmpfile"
+        done < "$CONFIG"
+        if ! mv "$tmpfile" "$CONFIG" 2>/dev/null; then
+            rm -f "$tmpfile" 2>/dev/null
+            echo "Failed to commit config update"
+            return 1
+        fi
+    fi
+
+    restore_rules
+
+    echo "Deleted: $pkg"
+}
+
+restore_rules() {
+    if [ ! -f "$CONFIG" ]; then
+        touch "$CONFIG"
+    fi
+
+    # Backup config before restore attempt for rollback on failure
+    config_backup="$(make_tmpfile configbak)"
+    if [ -z "$config_backup" ]; then
+        echo "Failed to create backup" >&2
+        return 1
+    fi
+    cp "$CONFIG" "$config_backup" 2>/dev/null || {
+        rm -f "$config_backup" 2>/dev/null
+        echo "Failed to backup config" >&2
+        return 1
+    }
+
+    init_chain
+    ipt -F "$CHAIN_NAME" 2>/dev/null
+    if command -v ip6tables >/dev/null 2>&1; then
+        ip6t -F "$CHAIN_NAME" 2>/dev/null
+    fi
+    load_uid_map
+    reject_seen="$(make_tmpfile rejectv4)"
+    reject_seen_v6="$(make_tmpfile rejectv6)"
+    if [ -z "$reject_seen" ] || [ -z "$reject_seen_v6" ]; then
+        rm -f "$reject_seen" "$reject_seen_v6" 2>/dev/null
+        echo "Failed to create temp files" >&2
+        return 1
+    fi
+    invalid_lines=0
+    current_section="whitelist"
+    line_no=0
+    while IFS= read -r line; do
+        line_no=$((line_no + 1))
+        case "$line" in
+            "[whitelist]")
+                current_section="whitelist"
+                continue
+                ;;
+            "[blacklist]")
+                current_section="blacklist"
+                continue
+                ;;
+            "#"*|"")
+                continue
+                ;;
+        esac
+
+        if ! parse_rule_line "$line"; then
+            case "$(trim_field "$line")" in
+                "")
+                    continue
+                    ;;
+            esac
+            invalid_lines=$((invalid_lines + 1))
+            echo "Invalid rule at line ${line_no}: $line" >&2
+            continue
+        fi
+
+        endpoint="$RULE_IP:$RULE_PORT"
+        if ! grep -Fxq "$endpoint" "$reject_seen" 2>/dev/null; then
+            printf '%s\n' "$endpoint" >> "$reject_seen"
+        fi
+
+        if rule_targets_loopback_v6 "$RULE_IP"; then
+            endpoint_v6="::1:$RULE_PORT"
+            if ! grep -Fxq "$endpoint_v6" "$reject_seen_v6" 2>/dev/null; then
+                printf '%s\n' "$endpoint_v6" >> "$reject_seen_v6"
+            fi
+        fi
+
+        uid=$(get_uid_from_map "$RULE_PKG")
+        if [ -n "$uid" ]; then
+            if [ "$current_section" = "whitelist" ]; then
+                for proto in tcp udp; do
+                    [ "$RULE_PROTO" = "tcp" ] && [ "$proto" = "udp" ] && continue
+                    [ "$RULE_PROTO" = "udp" ] && [ "$proto" = "tcp" ] && continue
+
+                    if ! run_with_retry ipt -A "$CHAIN_NAME" -p "$proto" -d "$RULE_IP" --dport "$RULE_PORT" -m owner --uid-owner "$uid" -j RETURN; then
+                        echo "Failed allow rule: $RULE_PKG ($uid) -> $RULE_IP:$RULE_PORT/$proto" >&2
+                    fi
+                    if rule_targets_loopback_v6 "$RULE_IP" && command -v ip6tables >/dev/null 2>&1; then
+                        if ! run_with_retry ip6t -A "$CHAIN_NAME" -p "$proto" -d ::1 --dport "$RULE_PORT" -m owner --uid-owner "$uid" -j RETURN; then
+                            echo "Failed allow v6 rule: $RULE_PKG ($uid) -> ::1:$RULE_PORT/$proto" >&2
+                        fi
+                    fi
+                done
+            else
+                for proto in tcp udp; do
+                    [ "$RULE_PROTO" = "tcp" ] && [ "$proto" = "udp" ] && continue
+                    [ "$RULE_PROTO" = "udp" ] && [ "$proto" = "tcp" ] && continue
+
+                    if ! run_with_retry ipt -A "$CHAIN_NAME" -p "$proto" -d "$RULE_IP" --dport "$RULE_PORT" -m owner --uid-owner "$uid" -j REJECT --reject-with tcp-reset; then
+                        echo "Failed block rule: $RULE_PKG ($uid) -> $RULE_IP:$RULE_PORT/$proto" >&2
+                    fi
+                    if rule_targets_loopback_v6 "$RULE_IP" && command -v ip6tables >/dev/null 2>&1; then
+                        if ! run_with_retry ip6t -A "$CHAIN_NAME" -p "$proto" -d ::1 --dport "$RULE_PORT" -m owner --uid-owner "$uid" -j REJECT --reject-with tcp-reset; then
+                            echo "Failed block v6 rule: $RULE_PKG ($uid) -> ::1:$RULE_PORT/$proto" >&2
+                        fi
+                    fi
+                done
+            fi
+        fi
+    done < "$CONFIG"
+    while IFS= read -r endpoint; do
+        [ -n "$endpoint" ] || continue
+        ip="${endpoint%:*}"
+        port="${endpoint##*:}"
+        for proto in tcp udp; do
+            if ! run_with_retry ipt -A "$CHAIN_NAME" -p "$proto" -d "$ip" --dport "$port" -j REJECT --reject-with tcp-reset; then
+                echo "Failed reject rule: $ip:$port/$proto" >&2
+            fi
+        done
+    done < "$reject_seen"
+    if command -v ip6tables >/dev/null 2>&1; then
+        while IFS= read -r endpoint; do
+            [ -n "$endpoint" ] || continue
+            ip="${endpoint%:*}"
+            port="${endpoint##*:}"
+            for proto in tcp udp; do
+                if ! run_with_retry ip6t -A "$CHAIN_NAME" -p "$proto" -d "$ip" --dport "$port" -j REJECT --reject-with tcp-reset; then
+                    echo "Failed reject v6 rule: $ip:$port/$proto" >&2
+                fi
+            done
+        done < "$reject_seen_v6"
+    fi
+    rm -f "$reject_seen" 2>/dev/null
+    rm -f "$reject_seen_v6" 2>/dev/null
+
+    if [ "$invalid_lines" -gt 0 ]; then
+        echo "Restored with warnings: invalid_rules_skipped=$invalid_lines"
+    else
+        echo "Restored"
+    fi
+
+    rm -f "$config_backup" 2>/dev/null
+    return 0
+}
+
+restore_rules_with_rollback() {
+    if [ ! -f "$CONFIG" ]; then
+        restore_rules
+        return $?
+    fi
+
+    config_before="$(make_tmpfile rollback)"
+    if [ -z "$config_before" ]; then
+        restore_rules
+        return $?
+    fi
+
+    cp "$CONFIG" "$config_before" 2>/dev/null || {
+        rm -f "$config_before" 2>/dev/null
+        restore_rules
+        return $?
+    }
+
+    if restore_rules; then
+        rm -f "$config_before" 2>/dev/null
+        return 0
+    fi
+
+    mv "$config_before" "$CONFIG" 2>/dev/null
+    if [ $? -eq 0 ]; then
+        echo "Restore failed; rolled back to previous config" >&2
+    else
+        rm -f "$config_before" 2>/dev/null
+    fi
+    return 1
+}
+
+list_rules() {
+    if [ ! -f "$CONFIG" ]; then
+        echo "[]"
+        return
+    fi
+    echo "["
+    first=1
+    current_section="whitelist"
+    while IFS= read -r line; do
+        trimmed="$(trim_field "$line")"
+        case "$trimmed" in
+            "[whitelist]")
+                current_section="whitelist"
+                continue
+                ;;
+            "[blacklist]")
+                current_section="blacklist"
+                continue
+                ;;
+            "#"*|"")
+                continue
+                ;;
+        esac
+        if ! parse_rule_line "$line"; then
+            continue
+        fi
+        if [ $first -eq 1 ]; then
+            first=0
+        else
+            echo ","
+        fi
+        printf '{"pkg":"%s","ip":"%s","port":"%s","section":"%s"}\n' "$RULE_PKG" "$RULE_IP" "$RULE_PORT" "$current_section"
+    done < "$CONFIG"
+    echo "]"
+}
+
+status_info() {
+    chain_exists=0
+    output_jump_exists=0
+    lock_state="unlocked"
+    lock_pid=""
+    rule_count=0
+
+    if ipt -L "$CHAIN_NAME" -n >/dev/null 2>&1; then
+        chain_exists=1
+    fi
+    if ipt -C OUTPUT -j "$CHAIN_NAME" >/dev/null 2>&1; then
+        output_jump_exists=1
+    fi
+
+    if [ -d "$LOCKDIR" ]; then
+        lock_state="locked"
+        if [ -f "${LOCKDIR}/pid" ]; then
+            lock_pid="$(cat "${LOCKDIR}/pid" 2>/dev/null)"
+        fi
+    fi
+
+    if [ -f "$CONFIG" ]; then
+        while IFS= read -r line; do
+            if parse_rule_line "$line"; then
+                rule_count=$((rule_count + 1))
+            fi
+        done < "$CONFIG"
+    fi
+
+    echo "chain_name=$CHAIN_NAME"
+    echo "chain_exists=$chain_exists"
+    echo "output_jump_exists=$output_jump_exists"
+    echo "iptables_wait=$IPTABLES_WAIT"
+    echo "lock_state=$lock_state"
+    echo "lock_pid=$lock_pid"
+    echo "config_path=$CONFIG"
+    echo "config_exists=$([ -f "$CONFIG" ] && echo 1 || echo 0)"
+    echo "rule_count=$rule_count"
+}
+
+check_rules() {
+    if [ ! -f "$CONFIG" ]; then
+        echo "No config file: $CONFIG"
+        return 0
+    fi
+
+    load_uid_map
+
+    total=0
+    valid=0
+    missing_pkg=0
+    invalid_lines=0
+
+    line_no=0
+    while IFS= read -r line; do
+        line_no=$((line_no + 1))
+        case "$(trim_field "$line")" in
+            "[whitelist]"|"[blacklist]"|"#"*|"")
+                continue
+                ;;
+        esac
+
+        total=$((total + 1))
+
+        if ! parse_rule_line "$line"; then
+            invalid_lines=$((invalid_lines + 1))
+            echo "invalid_line_${invalid_lines}=${line_no}:$line"
+            continue
+        fi
+
+        uid=$(get_uid_from_map "$RULE_PKG")
+        if [ -n "$uid" ]; then
+            valid=$((valid + 1))
+        else
+            missing_pkg=$((missing_pkg + 1))
+        fi
+    done < "$CONFIG"
+
+    echo "config_path=$CONFIG"
+    echo "rules_total=$total"
+    echo "rules_valid=$valid"
+    echo "rules_missing_pkg=$missing_pkg"
+    echo "rules_invalid_format=$invalid_lines"
+}
+
+healthcheck_info() {
+    config_ok=0
+    v4_ok=0
+    v6_ok=0
+    watcher_ok=0
+    lock_ok=0
+
+    [ -f "$CONFIG" ] && [ -r "$CONFIG" ] && config_ok=1
+
+    if ipt -L "$CHAIN_NAME" -n >/dev/null 2>&1 && ipt -C OUTPUT -j "$CHAIN_NAME" >/dev/null 2>&1; then
+        v4_ok=1
+    fi
+
+    if command -v ip6tables >/dev/null 2>&1; then
+        if ip6t -L "$CHAIN_NAME" -n >/dev/null 2>&1 && ip6t -C OUTPUT -j "$CHAIN_NAME" >/dev/null 2>&1; then
+            v6_ok=1
+        fi
+    else
+        v6_ok=1
+    fi
+
+    if [ -f "$WATCHER_PID_FILE" ]; then
+        watcher_pid="$(cat "$WATCHER_PID_FILE" 2>/dev/null)"
+        if [ -n "$watcher_pid" ] && kill -0 "$watcher_pid" 2>/dev/null; then
+            watcher_ok=1
+        fi
+    fi
+
+    [ ! -d "$LOCKDIR" ] && lock_ok=1
+
+    echo "config_ok=$config_ok"
+    echo "v4_chain_ok=$v4_ok"
+    echo "v6_chain_ok=$v6_ok"
+    echo "watcher_ok=$watcher_ok"
+    echo "lock_ok=$lock_ok"
+
+    if [ "$config_ok" -eq 1 ] && [ "$v4_ok" -eq 1 ] && [ "$v6_ok" -eq 1 ] && [ "$watcher_ok" -eq 1 ] && [ "$lock_ok" -eq 1 ]; then
+        return 0
+    fi
+    return 1
+}
+
+selftest_info() {
+    v4_chain=0
+    v4_jump=0
+    v6_available=0
+    v6_chain=0
+    v6_jump=0
+
+    if ipt -L "$CHAIN_NAME" -n >/dev/null 2>&1; then
+        v4_chain=1
+    fi
+    if ipt -C OUTPUT -j "$CHAIN_NAME" >/dev/null 2>&1; then
+        v4_jump=1
+    fi
+
+    if command -v ip6tables >/dev/null 2>&1; then
+        v6_available=1
+        if ip6t -L "$CHAIN_NAME" -n >/dev/null 2>&1; then
+            v6_chain=1
+        fi
+        if ip6t -C OUTPUT -j "$CHAIN_NAME" >/dev/null 2>&1; then
+            v6_jump=1
+        fi
+    fi
+
+    echo "chain_name=$CHAIN_NAME"
+    echo "v4_chain_exists=$v4_chain"
+    echo "v4_output_jump_exists=$v4_jump"
+    echo "v6_available=$v6_available"
+    echo "v6_chain_exists=$v6_chain"
+    echo "v6_output_jump_exists=$v6_jump"
+}
+
+init_iptables_mode
+init_ip6tables_mode
+
+case "$1" in
+    add)
+        shift
+        run_with_lock add_rule "$@"
+        ;;
+    del)
+        shift
+        run_with_lock del_rule "$@"
+        ;;
+    restore)
+        run_with_lock restore_rules_with_rollback
+        ;;
+    list)
+        list_rules
+        ;;
+    status)
+        status_info
+        ;;
+    check)
+        check_rules
+        ;;
+    selftest)
+        selftest_info
+        ;;
+    healthcheck)
+        healthcheck_info
+        ;;
+    *)
+        echo "Usage: $0 {add|del|restore|list|status|check|selftest|healthcheck}"
+        exit 1
+        ;;
+esac

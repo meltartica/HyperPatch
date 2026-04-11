@@ -1,0 +1,239 @@
+#!/system/bin/sh
+
+SELF_PATH="$(readlink -f "$0" 2>/dev/null)"
+[ -n "$SELF_PATH" ] || SELF_PATH="$0"
+case "$SELF_PATH" in
+    /*) ;;
+    *) SELF_PATH="$(pwd)/$SELF_PATH" ;;
+esac
+SCRIPT_DIR=${SELF_PATH%/*}
+MODDIR=${SCRIPT_DIR%/*}
+CTL="${MODDIR}/bin/service_hider_ctl"
+CHAIN_NAME="SERVICE_HIDER"
+LOCKDIR="${MODDIR}/.service_hider_lock"
+WATCHER_PID_FILE="${MODDIR}/.shw.pid"
+RULES_FILE="${MODDIR}/rules.conf"
+IPTABLES_WAIT=0
+IPTABLES6_WAIT=0
+LOG_BASE="/data/adb/hyperpatch_logs"
+LOG_FILE="${LOG_BASE}/service_hider.log"
+
+mkdir_log() {
+    mkdir -p "$LOG_BASE" 2>/dev/null
+    touch "$LOG_FILE" 2>/dev/null
+}
+
+log_msg() {
+    ts="$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)"
+    [ -n "$ts" ] || ts="[no-time]"
+    printf '%s %s %s\n' "[$ts]" "[HyperPatch][ServiceHider]" "$1" >> "$LOG_FILE" 2>/dev/null
+}
+
+rotate_log() {
+    if [ ! -f "$LOG_FILE" ]; then
+        return 0
+    fi
+
+    size="$(wc -c < "$LOG_FILE" 2>/dev/null)"
+    [ -z "$size" ] && size=0
+
+    max_size=$((512 * 1024))
+    if [ "$size" -ge "$max_size" ]; then
+        ts="$(date '+%Y%m%d_%H%M%S' 2>/dev/null)"
+        [ -n "$ts" ] || ts="rotated"
+        mv "$LOG_FILE" "${LOG_FILE}.${ts}" 2>/dev/null
+
+        find "${LOG_FILE%/*}" -name "${LOG_FILE##*/}.*" -type f 2>/dev/null | sort -r | tail -n +3 | xargs rm -f 2>/dev/null
+    fi
+}
+
+init_iptables_mode() {
+    if iptables -w -L OUTPUT -n >/dev/null 2>&1; then
+        IPTABLES_WAIT=1
+    fi
+}
+
+ipt() {
+    if [ "$IPTABLES_WAIT" = "1" ]; then
+        iptables -w "$@"
+    else
+        iptables "$@"
+    fi
+}
+
+init_ip6tables_mode() {
+    if command -v ip6tables >/dev/null 2>&1 && ip6tables -w -L OUTPUT -n >/dev/null 2>&1; then
+        IPTABLES6_WAIT=1
+    fi
+}
+
+ip6t() {
+    if [ "$IPTABLES6_WAIT" = "1" ]; then
+        ip6tables -w "$@"
+    else
+        ip6tables "$@"
+    fi
+}
+
+wait_for_boot() {
+    until [ "$(getprop sys.boot_completed)" = "1" ]; do
+        sleep 2
+    done
+}
+
+restore_rules() {
+    "${CTL}" restore >/dev/null 2>&1
+}
+
+file_signature() {
+    target="$1"
+    if [ ! -f "$target" ]; then
+        echo "missing"
+        return
+    fi
+
+    if command -v cksum >/dev/null 2>&1; then
+        cksum "$target" 2>/dev/null | awk '{print $1":"$2}'
+        return
+    fi
+
+    wc -c < "$target" 2>/dev/null | awk '{print "size:"$1}'
+}
+
+watch_state_signature() {
+    sig_xml="$(file_signature /data/system/packages.xml)"
+    sig_list="$(file_signature /data/system/packages.list)"
+    sig_rules="$(file_signature "$RULES_FILE")"
+    echo "${sig_xml}|${sig_list}|${sig_rules}"
+}
+
+watch_package_changes() {
+    if ! command -v inotifyd >/dev/null 2>&1; then
+        echo "ServiceHider: inotifyd not found; package reload watcher disabled."
+        return 0
+    fi
+
+    last_restore=0
+    last_watch_state="$(watch_state_signature)"
+    restore_attempts=0
+    watcher_restarts=0
+
+    while true; do
+        watch_specs=""
+        [ -e /data/system/packages.xml ] && watch_specs="${watch_specs} /data/system/packages.xml:cew0"
+        [ -e /data/system/packages.list ] && watch_specs="${watch_specs} /data/system/packages.list:cew0"
+        [ -e "$RULES_FILE" ] && watch_specs="${watch_specs} ${RULES_FILE}:cew0"
+        [ -z "$watch_specs" ] && [ -d /data/system ] && watch_specs=" /data/system:cew0"
+        [ -z "$watch_specs" ] && [ -d "$MODDIR" ] && watch_specs=" ${MODDIR}:cew0"
+
+        if [ -z "$watch_specs" ]; then
+            sleep 10
+            continue
+        fi
+
+        # Stream inotify events and restore rules only when package state signature changed.
+        # shellcheck disable=SC2086
+        inotifyd - $watch_specs 2>/dev/null | while IFS= read -r _line; do
+                now="$(date +%s 2>/dev/null)"
+                [ -z "$now" ] && now=0
+                if [ $((now - last_restore)) -lt 2 ]; then
+                    continue
+                fi
+
+                current_watch_state="$(watch_state_signature)"
+                if [ "$current_watch_state" = "$last_watch_state" ]; then
+                    continue
+                fi
+
+                restore_attempts=$((restore_attempts + 1))
+                log_msg "restore attempt from watcher count=$restore_attempts"
+                sleep 1
+                if restore_rules; then
+                    log_msg "restore ok from watcher (attempt=$restore_attempts)"
+                else
+                    log_msg "restore failed from watcher (attempt=$restore_attempts)"
+                fi
+                last_restore="$now"
+                last_watch_state="$current_watch_state"
+        done
+
+        # Restart watcher when event stream exits (path changes/unwatchable state).
+        watcher_restarts=$((watcher_restarts + 1))
+        log_msg "watcher restart count=$watcher_restarts"
+        sleep 1
+    done
+}
+
+run_service() {
+    mkdir_log
+    rotate_log
+    log_msg "service hook entered"
+    if [ -f "$WATCHER_PID_FILE" ]; then
+        old_pid="$(cat "$WATCHER_PID_FILE" 2>/dev/null)"
+        if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
+            log_msg "watcher already running (pid=$old_pid)"
+            return 0
+        fi
+        rm -f "$WATCHER_PID_FILE" 2>/dev/null
+    fi
+
+    (
+        if [ "$SERVICE_HIDER_BOOT_READY" != "1" ]; then
+            wait_for_boot
+        fi
+        log_msg "restoring rules (boot)"
+        if restore_rules; then
+            log_msg "restore ok (boot)"
+        else
+            log_msg "restore failed (boot)"
+        fi
+        log_msg "starting package watcher"
+        watch_package_changes
+    ) &
+    echo "$!" > "$WATCHER_PID_FILE" 2>/dev/null
+    log_msg "watcher started (pid=$!)"
+}
+
+run_post_fs_data() {
+    return 0
+}
+
+run_uninstall() {
+    log_msg "uninstall hook entered"
+    if [ -f "$WATCHER_PID_FILE" ]; then
+        watcher_pid="$(cat "$WATCHER_PID_FILE" 2>/dev/null)"
+        if [ -n "$watcher_pid" ] && kill -0 "$watcher_pid" 2>/dev/null; then
+            log_msg "stopping watcher (pid=$watcher_pid)"
+            kill "$watcher_pid" 2>/dev/null
+        fi
+        rm -f "$WATCHER_PID_FILE" 2>/dev/null
+    fi
+
+    init_iptables_mode
+    init_ip6tables_mode
+    ipt -D OUTPUT -j "$CHAIN_NAME" 2>/dev/null
+    ipt -F "$CHAIN_NAME" 2>/dev/null
+    ipt -X "$CHAIN_NAME" 2>/dev/null
+    if command -v ip6tables >/dev/null 2>&1; then
+        ip6t -D OUTPUT -j "$CHAIN_NAME" 2>/dev/null
+        ip6t -F "$CHAIN_NAME" 2>/dev/null
+        ip6t -X "$CHAIN_NAME" 2>/dev/null
+    fi
+    rm -rf "$LOCKDIR" 2>/dev/null
+}
+
+case "$1" in
+    service)
+        run_service
+        ;;
+    post-fs-data)
+        run_post_fs_data
+        ;;
+    uninstall)
+        run_uninstall
+        ;;
+    *)
+        echo "Usage: $0 {service|post-fs-data|uninstall}"
+        exit 1
+        ;;
+esac
