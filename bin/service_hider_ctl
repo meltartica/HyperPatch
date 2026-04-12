@@ -1,13 +1,7 @@
 #!/system/bin/sh
 
-SELF_PATH="$(readlink -f "$0" 2>/dev/null)"
-[ -n "$SELF_PATH" ] || SELF_PATH="$0"
-case "$SELF_PATH" in
-    /*) ;;
-    *) SELF_PATH="$(pwd)/$SELF_PATH" ;;
-esac
-SCRIPT_DIR=${SELF_PATH%/*}
-MODDIR=${SCRIPT_DIR%/*}
+SCRIPT_DIR="${0%/*}"
+MODDIR="${SCRIPT_DIR%/*}"
 CONFIG=${MODDIR}/rules.conf
 CHAIN_NAME="SERVICE_HIDER"
 WATCHER_PID_FILE="${MODDIR}/.shw.pid"
@@ -16,12 +10,21 @@ LOCKDIR="${MODDIR}/.service_hider_lock"
 IPTABLES_WAIT=0
 IPTABLES6_WAIT=0
 
+# 在启动时缓存一次 二进制可用性在运行时从不改变
+_HAS_IP6TABLES=0
+command -v ip6tables >/dev/null 2>&1 && _HAS_IP6TABLES=1
+
+# 缓存回车符以避免在每次调用 trim_field 时产生 printf 子 shell
+_CR=$(printf '\r')
+
+# 检测 iptables 是否支持等待锁并初始化模式
 init_iptables_mode() {
     if iptables -w -L OUTPUT -n >/dev/null 2>&1; then
         IPTABLES_WAIT=1
     fi
 }
 
+# 封装 iptables 调用并根据支持情况自动携带等待参数
 ipt() {
     if [ "$IPTABLES_WAIT" = "1" ]; then
         iptables -w "$@"
@@ -30,12 +33,14 @@ ipt() {
     fi
 }
 
+# 检测 ip6tables 是否可用及是否支持等待锁
 init_ip6tables_mode() {
-    if command -v ip6tables >/dev/null 2>&1 && ip6tables -w -L OUTPUT -n >/dev/null 2>&1; then
+    if [ "$_HAS_IP6TABLES" = "1" ] && ip6tables -w -L OUTPUT -n >/dev/null 2>&1; then
         IPTABLES6_WAIT=1
     fi
 }
 
+# 封装 ip6tables 调用并自动携带等待参数
 ip6t() {
     if [ "$IPTABLES6_WAIT" = "1" ]; then
         ip6tables -w "$@"
@@ -44,11 +49,12 @@ ip6t() {
     fi
 }
 
+# 获取带重试机制的独占锁以避免并发修改冲突
 acquire_lock() {
     attempts=0
     while ! mkdir "$LOCKDIR" 2>/dev/null; do
         if [ -f "${LOCKDIR}/pid" ]; then
-            lock_pid="$(cat "${LOCKDIR}/pid" 2>/dev/null)"
+            read -r lock_pid < "${LOCKDIR}/pid" 2>/dev/null || lock_pid=""
             if [ -n "$lock_pid" ] && ! kill -0 "$lock_pid" 2>/dev/null; then
                 rm -f "${LOCKDIR}/pid" 2>/dev/null
                 rmdir "$LOCKDIR" 2>/dev/null
@@ -66,11 +72,13 @@ acquire_lock() {
     return 0
 }
 
+# 释放之前获取的独占锁
 release_lock() {
     rm -f "${LOCKDIR}/pid" 2>/dev/null
     rmdir "$LOCKDIR" 2>/dev/null
 }
 
+# 创建带有时间戳和进程标识的临时文件 失败则尝试回退路径
 make_tmpfile() {
     label="$1"
     tmp="$(mktemp 2>/dev/null)"
@@ -78,7 +86,6 @@ make_tmpfile() {
         printf '%s\n' "$tmp"
         return 0
     fi
-
     ts="$(date +%s 2>/dev/null)"
     [ -n "$ts" ] || ts="0"
     tmp="${MODDIR}/.${label}.$$.$ts.tmp"
@@ -87,36 +94,7 @@ make_tmpfile() {
     return 0
 }
 
-append_rule_atomic() {
-    line="$1"
-    tmpfile="$(make_tmpfile addrule)"
-    if [ -z "$tmpfile" ]; then
-        echo "Failed to create temp file" >&2
-        return 1
-    fi
-
-    if [ -f "$CONFIG" ]; then
-        cat "$CONFIG" > "$tmpfile" 2>/dev/null || {
-            rm -f "$tmpfile" 2>/dev/null
-            echo "Failed to stage existing config" >&2
-            return 1
-        }
-    fi
-
-    printf '%s\n\n' "$line" >> "$tmpfile" || {
-        rm -f "$tmpfile" 2>/dev/null
-        echo "Failed to write staged config" >&2
-        return 1
-    }
-
-    mv "$tmpfile" "$CONFIG" 2>/dev/null || {
-        rm -f "$tmpfile" 2>/dev/null
-        echo "Failed to commit config update" >&2
-        return 1
-    }
-    return 0
-}
-
+# 带有间隔递增的命令重试执行器 最多重试三次
 run_with_retry() {
     tries=0
     while true; do
@@ -125,16 +103,15 @@ run_with_retry() {
         if [ "$rc" -eq 0 ]; then
             return 0
         fi
-
         tries=$((tries + 1))
         if [ "$tries" -ge 3 ]; then
             return "$rc"
         fi
-
         sleep "$tries"
     done
 }
 
+# 在持锁上下文中安全地执行指定命令并在结束时释放锁
 run_with_lock() {
     acquire_lock || return 1
     trap 'release_lock' EXIT INT TERM
@@ -145,15 +122,14 @@ run_with_lock() {
     return "$status"
 }
 
+# 验证提供的字符串是否为合法的 IPv4 地址
 is_valid_ipv4() {
     ip="$1"
     rem="$ip"
     a="${rem%%.*}"; rem="${rem#*.}"
     b="${rem%%.*}"; rem="${rem#*.}"
     c="${rem%%.*}"; d="${rem#*.}"
-    
     case "$d" in *.*) return 1 ;; esac
-    
     for i in "$a" "$b" "$c" "$d"; do
         case "$i" in
             '' | *[!0-9]*) return 1 ;;
@@ -163,6 +139,7 @@ is_valid_ipv4() {
     return 0
 }
 
+# 验证提供的字符串是否为合法的 IPv4 地址或 CIDR 提供范围
 is_valid_ipv4_or_cidr() {
     ip="$1"
     case "$ip" in
@@ -178,6 +155,7 @@ is_valid_ipv4_or_cidr() {
     is_valid_ipv4 "$ip"
 }
 
+# 验证协议参数是否在支持范围内 仅限 tcp udp 或是 both
 is_valid_proto() {
     case "$1" in
         tcp|udp|both) return 0 ;;
@@ -185,22 +163,23 @@ is_valid_proto() {
     return 1
 }
 
+# 验证提供的端口号是否为一到六万五千五百三十五之间的合法数值
 is_valid_port() {
     case "$1" in
-        ''|*[!0-9]*)
-            return 1
-            ;;
+        ''|*[!0-9]*) return 1 ;;
     esac
     [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
 }
 
+# 剥离字符串两端空白以及行尾隐藏的特殊回车符
 trim_field() {
-    # Native shell word-splitting instantly drops leading/trailing spaces without spawning computationally expensive 'sed' forks.
-    t="${1%"$(printf '\r')"}"
+    # 使用缓存的 CR 剥离结尾的 r 避免每次调用产生 printf 子 shell
+    t="${1%"$_CR"}"
     set -- $t
     printf '%s' "$*"
 }
 
+# 解析并验证配置文件中的单行规则 提取包名 IP 端口和协议
 parse_rule_line() {
     line="$(trim_field "$1")"
     RULE_PKG=""
@@ -209,7 +188,7 @@ parse_rule_line() {
     RULE_PROTO="tcp"
 
     case "$line" in
-        ""|\#*)
+        ""|"#"*)
             return 1
             ;;
         *"|"*)
@@ -255,6 +234,7 @@ parse_rule_line() {
     return 0
 }
 
+# 根据提供的参数格式化成一行标准的规则文本
 format_rule() {
     pkg="$1"
     ip="$2"
@@ -267,17 +247,17 @@ format_rule() {
     fi
 }
 
+# 初始化自定义的 iptables 和 ip6tables 拦截链并挂载到主链
 init_chain() {
     if ! ipt -L "$CHAIN_NAME" -n >/dev/null 2>&1; then
         ipt -N "$CHAIN_NAME"
     fi
-
     while ipt -D OUTPUT -j "$CHAIN_NAME" >/dev/null 2>&1; do
         :
     done
     ipt -I OUTPUT 1 -j "$CHAIN_NAME"
 
-    if command -v ip6tables >/dev/null 2>&1; then
+    if [ "$_HAS_IP6TABLES" = "1" ]; then
         if ! ip6t -L "$CHAIN_NAME" -n >/dev/null 2>&1; then
             ip6t -N "$CHAIN_NAME"
         fi
@@ -288,15 +268,15 @@ init_chain() {
     fi
 }
 
+# 检查目标 IPv4 是否为本地回环地址 以便进行 v6 规则克隆
 rule_targets_loopback_v6() {
     case "$1" in
-        127.*)
-            return 0
-            ;;
+        127.*) return 0 ;;
     esac
     return 1
 }
 
+# 加载系统已安装应用程序的名称和系统对应的映射表
 load_uid_map() {
     if [ -r /data/system/packages.list ]; then
         UID_MAP="$(awk '{print $1"="$2}' /data/system/packages.list)"
@@ -305,31 +285,36 @@ load_uid_map() {
     fi
 }
 
+# 从事先加载的映射表中快速获取指定包名的对应数值
 get_uid_from_map() {
-    pkg="$1"
+    # 纯 shell 行扫描 没有 printf grep cut 子 shell 链
     [ -z "$UID_MAP" ] && return
-    printf '%s\n' "$UID_MAP" | grep "^${pkg}=" | cut -d= -f2
+    _nl='
+'
+    _rem="$UID_MAP"
+    while [ -n "$_rem" ]; do
+        _line="${_rem%%${_nl}*}"
+        _rem="${_rem#*${_nl}}"
+        [ "$_rem" = "$_line" ] && _rem=""
+        case "$_line" in
+            "$1="*) printf '%s\n' "${_line#*=}"; return ;;
+        esac
+    done
 }
 
-get_uid() {
-    if [ -r /data/system/packages.list ]; then
-        awk -v pkg="$1" '$1 == pkg { print $2; exit }' /data/system/packages.list
-    else
-        pm list packages -U 2>/dev/null | grep -F "package:$1 " | sed -n 's/.*uid:\([0-9]*\).*/\1/p'
-    fi
-}
-
+# 验证参数并在配置文件中追加一条全新的黑白名单规则
 add_rule() {
     pkg=$1
     ip=$2
     port=$3
     section="${4:-whitelist}"
+    proto="${5:-tcp}"
 
     if [ -z "$pkg" ]; then
         echo "Package is required"
         return 1
     fi
-    if ! is_valid_ipv4 "$ip"; then
+    if ! is_valid_ipv4_or_cidr "$ip"; then
         echo "Invalid IP: $ip"
         return 1
     fi
@@ -344,10 +329,15 @@ add_rule() {
             return 1
             ;;
     esac
+    if ! is_valid_proto "$proto"; then
+        echo "Invalid proto: $proto (use 'tcp', 'udp', or 'both')"
+        return 1
+    fi
 
     [ -f "$CONFIG" ] || { echo "[whitelist]" > "$CONFIG"; }
 
-    line="$(format_rule "$pkg" "$ip" "$port")"
+    # 检查确切规则 包含协议 以避免重复检测失败
+    line="$(format_rule "$pkg" "$ip" "$port" "$proto")"
     if grep -Fxq "$line" "$CONFIG" 2>/dev/null; then
         echo "Already exists: $pkg"
         return 0
@@ -359,7 +349,7 @@ add_rule() {
         return 1
     fi
 
-    if grep -Fxq "[\n$section\n]" "$CONFIG" 2>/dev/null || grep -Fxq "[$section]" "$CONFIG" 2>/dev/null; then
+    if grep -Fxq "[$section]" "$CONFIG" 2>/dev/null; then
         tmpfile="$(make_tmpfile addsect)"
         if [ -z "$tmpfile" ]; then
             echo "Failed to create temp file"
@@ -395,12 +385,13 @@ add_rule() {
     echo "Added: $pkg to $section"
 }
 
+# 扫描配置文件并将匹配指定参数的单条规则进行安全删除
 del_rule() {
     pkg=$1
     ip=$2
     port=$3
 
-    if [ -z "$pkg" ] || ! is_valid_ipv4 "$ip" || ! is_valid_port "$port"; then
+    if [ -z "$pkg" ] || ! is_valid_ipv4_or_cidr "$ip" || ! is_valid_port "$port"; then
         echo "Usage: del <package> <ip> <port>"
         return 1
     fi
@@ -415,8 +406,7 @@ del_rule() {
             trimmed="$(trim_field "$line")"
             if ! parse_rule_line "$line"; then
                 case "$trimmed" in
-                    "")
-                        ;;
+                    "") ;;
                     "[whitelist]"|"[blacklist]")
                         printf '%s\n' "$trimmed" >> "$tmpfile"
                         ;;
@@ -431,7 +421,7 @@ del_rule() {
                 continue
             fi
 
-            printf '%s\n' "$(format_rule "$RULE_PKG" "$RULE_IP" "$RULE_PORT")" >> "$tmpfile"
+            printf '%s\n' "$(format_rule "$RULE_PKG" "$RULE_IP" "$RULE_PORT" "$RULE_PROTO")" >> "$tmpfile"
         done < "$CONFIG"
         if ! mv "$tmpfile" "$CONFIG" 2>/dev/null; then
             rm -f "$tmpfile" 2>/dev/null
@@ -441,32 +431,19 @@ del_rule() {
     fi
 
     restore_rules
-
     echo "Deleted: $pkg"
 }
 
+# 读取配置文件重置拦截链并根据映射表重新下发全部规则
 restore_rules() {
     if [ ! -f "$CONFIG" ]; then
         touch "$CONFIG"
     fi
 
-    # Backup config before restore attempt for rollback on failure
-    config_backup="$(make_tmpfile configbak)"
-    if [ -z "$config_backup" ]; then
-        echo "Failed to create backup" >&2
-        return 1
-    fi
-    cp "$CONFIG" "$config_backup" 2>/dev/null || {
-        rm -f "$config_backup" 2>/dev/null
-        echo "Failed to backup config" >&2
-        return 1
-    }
-
     init_chain
     ipt -F "$CHAIN_NAME" 2>/dev/null
-    if command -v ip6tables >/dev/null 2>&1; then
-        ip6t -F "$CHAIN_NAME" 2>/dev/null
-    fi
+    [ "$_HAS_IP6TABLES" = "1" ] && ip6t -F "$CHAIN_NAME" 2>/dev/null
+
     load_uid_map
     reject_seen="$(make_tmpfile rejectv4)"
     reject_seen_v6="$(make_tmpfile rejectv6)"
@@ -475,30 +452,21 @@ restore_rules() {
         echo "Failed to create temp files" >&2
         return 1
     fi
+
     invalid_lines=0
     current_section="whitelist"
     line_no=0
     while IFS= read -r line; do
         line_no=$((line_no + 1))
         case "$line" in
-            "[whitelist]")
-                current_section="whitelist"
-                continue
-                ;;
-            "[blacklist]")
-                current_section="blacklist"
-                continue
-                ;;
-            "#"*|"")
-                continue
-                ;;
+            "[whitelist]") current_section="whitelist"; continue ;;
+            "[blacklist]") current_section="blacklist"; continue ;;
+            "#"*|"") continue ;;
         esac
 
         if ! parse_rule_line "$line"; then
             case "$(trim_field "$line")" in
-                "")
-                    continue
-                    ;;
+                "") continue ;;
             esac
             invalid_lines=$((invalid_lines + 1))
             echo "Invalid rule at line ${line_no}: $line" >&2
@@ -507,10 +475,7 @@ restore_rules() {
 
         endpoint="$RULE_IP:$RULE_PORT"
         printf '%s\n' "$endpoint" >> "$reject_seen"
-
-        if rule_targets_loopback_v6 "$RULE_IP"; then
-            printf '%s\n' "::1:$RULE_PORT" >> "$reject_seen_v6"
-        fi
+        rule_targets_loopback_v6 "$RULE_IP" && printf '%s\n' "::1:$RULE_PORT" >> "$reject_seen_v6"
 
         uid=$(get_uid_from_map "$RULE_PKG")
         if [ -n "$uid" ]; then
@@ -518,11 +483,10 @@ restore_rules() {
                 for proto in tcp udp; do
                     [ "$RULE_PROTO" = "tcp" ] && [ "$proto" = "udp" ] && continue
                     [ "$RULE_PROTO" = "udp" ] && [ "$proto" = "tcp" ] && continue
-
                     if ! run_with_retry ipt -A "$CHAIN_NAME" -p "$proto" -d "$RULE_IP" --dport "$RULE_PORT" -m owner --uid-owner "$uid" -j RETURN; then
                         echo "Failed allow rule: $RULE_PKG ($uid) -> $RULE_IP:$RULE_PORT/$proto" >&2
                     fi
-                    if rule_targets_loopback_v6 "$RULE_IP" && command -v ip6tables >/dev/null 2>&1; then
+                    if rule_targets_loopback_v6 "$RULE_IP" && [ "$_HAS_IP6TABLES" = "1" ]; then
                         if ! run_with_retry ip6t -A "$CHAIN_NAME" -p "$proto" -d ::1 --dport "$RULE_PORT" -m owner --uid-owner "$uid" -j RETURN; then
                             echo "Failed allow v6 rule: $RULE_PKG ($uid) -> ::1:$RULE_PORT/$proto" >&2
                         fi
@@ -532,11 +496,10 @@ restore_rules() {
                 for proto in tcp udp; do
                     [ "$RULE_PROTO" = "tcp" ] && [ "$proto" = "udp" ] && continue
                     [ "$RULE_PROTO" = "udp" ] && [ "$proto" = "tcp" ] && continue
-
                     if ! run_with_retry ipt -A "$CHAIN_NAME" -p "$proto" -d "$RULE_IP" --dport "$RULE_PORT" -m owner --uid-owner "$uid" -j REJECT --reject-with tcp-reset; then
                         echo "Failed block rule: $RULE_PKG ($uid) -> $RULE_IP:$RULE_PORT/$proto" >&2
                     fi
-                    if rule_targets_loopback_v6 "$RULE_IP" && command -v ip6tables >/dev/null 2>&1; then
+                    if rule_targets_loopback_v6 "$RULE_IP" && [ "$_HAS_IP6TABLES" = "1" ]; then
                         if ! run_with_retry ip6t -A "$CHAIN_NAME" -p "$proto" -d ::1 --dport "$RULE_PORT" -m owner --uid-owner "$uid" -j REJECT --reject-with tcp-reset; then
                             echo "Failed block v6 rule: $RULE_PKG ($uid) -> ::1:$RULE_PORT/$proto" >&2
                         fi
@@ -545,9 +508,9 @@ restore_rules() {
             fi
         fi
     done < "$CONFIG"
-    
-    # Bulk deduplicate entirely eliminating grep sub forks
-    sort -u "$reject_seen" > "${reject_seen}.tmp" 2>/dev/null && mv "${reject_seen}.tmp" "$reject_seen" 2>/dev/null
+
+    # 在发出全拦截 REJECT 规则前对端点列表去重
+    sort -u "$reject_seen"    > "${reject_seen}.tmp"    2>/dev/null && mv "${reject_seen}.tmp"    "$reject_seen"    2>/dev/null
     sort -u "$reject_seen_v6" > "${reject_seen_v6}.tmp" 2>/dev/null && mv "${reject_seen_v6}.tmp" "$reject_seen_v6" 2>/dev/null
 
     while IFS= read -r endpoint; do
@@ -555,36 +518,33 @@ restore_rules() {
         ip="${endpoint%:*}"
         port="${endpoint##*:}"
         for proto in tcp udp; do
-            if ! run_with_retry ipt -A "$CHAIN_NAME" -p "$proto" -d "$ip" --dport "$port" -j REJECT --reject-with tcp-reset; then
-                echo "Failed reject rule: $ip:$port/$proto" >&2
-            fi
+            run_with_retry ipt -A "$CHAIN_NAME" -p "$proto" -d "$ip" --dport "$port" -j REJECT --reject-with tcp-reset \
+                || echo "Failed reject rule: $ip:$port/$proto" >&2
         done
     done < "$reject_seen"
-    if command -v ip6tables >/dev/null 2>&1; then
+
+    if [ "$_HAS_IP6TABLES" = "1" ]; then
         while IFS= read -r endpoint; do
             [ -n "$endpoint" ] || continue
             ip="${endpoint%:*}"
             port="${endpoint##*:}"
             for proto in tcp udp; do
-                if ! run_with_retry ip6t -A "$CHAIN_NAME" -p "$proto" -d "$ip" --dport "$port" -j REJECT --reject-with tcp-reset; then
-                    echo "Failed reject v6 rule: $ip:$port/$proto" >&2
-                fi
+                run_with_retry ip6t -A "$CHAIN_NAME" -p "$proto" -d "$ip" --dport "$port" -j REJECT --reject-with tcp-reset \
+                    || echo "Failed reject v6 rule: $ip:$port/$proto" >&2
             done
         done < "$reject_seen_v6"
     fi
-    rm -f "$reject_seen" 2>/dev/null
-    rm -f "$reject_seen_v6" 2>/dev/null
+    rm -f "$reject_seen" "$reject_seen_v6" 2>/dev/null
 
     if [ "$invalid_lines" -gt 0 ]; then
         echo "Restored with warnings: invalid_rules_skipped=$invalid_lines"
     else
         echo "Restored"
     fi
-
-    rm -f "$config_backup" 2>/dev/null
     return 0
 }
 
+# 带有错误回滚机制的规则应用 当恢复失败时会自动回滚配置
 restore_rules_with_rollback() {
     if [ ! -f "$CONFIG" ]; then
         restore_rules
@@ -608,8 +568,7 @@ restore_rules_with_rollback() {
         return 0
     fi
 
-    mv "$config_before" "$CONFIG" 2>/dev/null
-    if [ $? -eq 0 ]; then
+    if mv "$config_before" "$CONFIG" 2>/dev/null; then
         echo "Restore failed; rolled back to previous config" >&2
     else
         rm -f "$config_before" 2>/dev/null
@@ -617,6 +576,7 @@ restore_rules_with_rollback() {
     return 1
 }
 
+# 读取并解析配置文件内容以 JSON 格式输出当前所有规则
 list_rules() {
     if [ ! -f "$CONFIG" ]; then
         echo "[]"
@@ -628,17 +588,9 @@ list_rules() {
     while IFS= read -r line; do
         trimmed="$(trim_field "$line")"
         case "$trimmed" in
-            "[whitelist]")
-                current_section="whitelist"
-                continue
-                ;;
-            "[blacklist]")
-                current_section="blacklist"
-                continue
-                ;;
-            "#"*|"")
-                continue
-                ;;
+            "[whitelist]") current_section="whitelist"; continue ;;
+            "[blacklist]") current_section="blacklist"; continue ;;
+            "#"*|"") continue ;;
         esac
         if ! parse_rule_line "$line"; then
             continue
@@ -648,11 +600,13 @@ list_rules() {
         else
             echo ","
         fi
-        printf '{"pkg":"%s","ip":"%s","port":"%s","section":"%s"}\n' "$RULE_PKG" "$RULE_IP" "$RULE_PORT" "$current_section"
+        printf '{"pkg":"%s","ip":"%s","port":"%s","proto":"%s","section":"%s"}\n' \
+            "$RULE_PKG" "$RULE_IP" "$RULE_PORT" "$RULE_PROTO" "$current_section"
     done < "$CONFIG"
     echo "]"
 }
 
+# 诊断并输出当前服务规则文件的运行状态及进程死锁情况
 status_info() {
     chain_exists=0
     output_jump_exists=0
@@ -660,25 +614,17 @@ status_info() {
     lock_pid=""
     rule_count=0
 
-    if ipt -L "$CHAIN_NAME" -n >/dev/null 2>&1; then
-        chain_exists=1
-    fi
-    if ipt -C OUTPUT -j "$CHAIN_NAME" >/dev/null 2>&1; then
-        output_jump_exists=1
-    fi
+    ipt -L "$CHAIN_NAME" -n >/dev/null 2>&1 && chain_exists=1
+    ipt -C OUTPUT -j "$CHAIN_NAME" >/dev/null 2>&1 && output_jump_exists=1
 
     if [ -d "$LOCKDIR" ]; then
         lock_state="locked"
-        if [ -f "${LOCKDIR}/pid" ]; then
-            lock_pid="$(cat "${LOCKDIR}/pid" 2>/dev/null)"
-        fi
+        [ -f "${LOCKDIR}/pid" ] && { read -r lock_pid < "${LOCKDIR}/pid" 2>/dev/null || lock_pid=""; }
     fi
 
     if [ -f "$CONFIG" ]; then
         while IFS= read -r line; do
-            if parse_rule_line "$line"; then
-                rule_count=$((rule_count + 1))
-            fi
+            parse_rule_line "$line" && rule_count=$((rule_count + 1))
         done < "$CONFIG"
     fi
 
@@ -693,6 +639,7 @@ status_info() {
     echo "rule_count=$rule_count"
 }
 
+# 读取配置文件统计规则总数 以及检查验证失败或包名无效等问题
 check_rules() {
     if [ ! -f "$CONFIG" ]; then
         echo "No config file: $CONFIG"
@@ -700,29 +647,19 @@ check_rules() {
     fi
 
     load_uid_map
+    total=0; valid=0; missing_pkg=0; invalid_lines=0; line_no=0
 
-    total=0
-    valid=0
-    missing_pkg=0
-    invalid_lines=0
-
-    line_no=0
     while IFS= read -r line; do
         line_no=$((line_no + 1))
         case "$(trim_field "$line")" in
-            "[whitelist]"|"[blacklist]"|"#"*|"")
-                continue
-                ;;
+            "[whitelist]"|"[blacklist]"|"#"*|"") continue ;;
         esac
-
         total=$((total + 1))
-
         if ! parse_rule_line "$line"; then
             invalid_lines=$((invalid_lines + 1))
             echo "invalid_line_${invalid_lines}=${line_no}:$line"
             continue
         fi
-
         uid=$(get_uid_from_map "$RULE_PKG")
         if [ -n "$uid" ]; then
             valid=$((valid + 1))
@@ -738,12 +675,9 @@ check_rules() {
     echo "rules_invalid_format=$invalid_lines"
 }
 
+# 提供快速只读的布尔值结果 检查整个组件依赖和链的健康状态
 healthcheck_info() {
-    config_ok=0
-    v4_ok=0
-    v6_ok=0
-    watcher_ok=0
-    lock_ok=0
+    config_ok=0; v4_ok=0; v6_ok=0; watcher_ok=0; lock_ok=0
 
     [ -f "$CONFIG" ] && [ -r "$CONFIG" ] && config_ok=1
 
@@ -751,7 +685,7 @@ healthcheck_info() {
         v4_ok=1
     fi
 
-    if command -v ip6tables >/dev/null 2>&1; then
+    if [ "$_HAS_IP6TABLES" = "1" ]; then
         if ip6t -L "$CHAIN_NAME" -n >/dev/null 2>&1 && ip6t -C OUTPUT -j "$CHAIN_NAME" >/dev/null 2>&1; then
             v6_ok=1
         fi
@@ -760,10 +694,8 @@ healthcheck_info() {
     fi
 
     if [ -f "$WATCHER_PID_FILE" ]; then
-        watcher_pid="$(cat "$WATCHER_PID_FILE" 2>/dev/null)"
-        if [ -n "$watcher_pid" ] && kill -0 "$watcher_pid" 2>/dev/null; then
-            watcher_ok=1
-        fi
+        read -r watcher_pid < "$WATCHER_PID_FILE" 2>/dev/null || watcher_pid=""
+        [ -n "$watcher_pid" ] && kill -0 "$watcher_pid" 2>/dev/null && watcher_ok=1
     fi
 
     [ ! -d "$LOCKDIR" ] && lock_ok=1
@@ -774,34 +706,21 @@ healthcheck_info() {
     echo "watcher_ok=$watcher_ok"
     echo "lock_ok=$lock_ok"
 
-    if [ "$config_ok" -eq 1 ] && [ "$v4_ok" -eq 1 ] && [ "$v6_ok" -eq 1 ] && [ "$watcher_ok" -eq 1 ] && [ "$lock_ok" -eq 1 ]; then
-        return 0
-    fi
-    return 1
+    [ "$config_ok" -eq 1 ] && [ "$v4_ok" -eq 1 ] && [ "$v6_ok" -eq 1 ] && \
+        [ "$watcher_ok" -eq 1 ] && [ "$lock_ok" -eq 1 ]
 }
 
+# 打印底层网络包过滤链本身的连通性和独立健康状况
 selftest_info() {
-    v4_chain=0
-    v4_jump=0
-    v6_available=0
-    v6_chain=0
-    v6_jump=0
+    v4_chain=0; v4_jump=0; v6_available=0; v6_chain=0; v6_jump=0
 
-    if ipt -L "$CHAIN_NAME" -n >/dev/null 2>&1; then
-        v4_chain=1
-    fi
-    if ipt -C OUTPUT -j "$CHAIN_NAME" >/dev/null 2>&1; then
-        v4_jump=1
-    fi
+    ipt -L "$CHAIN_NAME" -n >/dev/null 2>&1   && v4_chain=1
+    ipt -C OUTPUT -j "$CHAIN_NAME" >/dev/null 2>&1 && v4_jump=1
 
-    if command -v ip6tables >/dev/null 2>&1; then
+    if [ "$_HAS_IP6TABLES" = "1" ]; then
         v6_available=1
-        if ip6t -L "$CHAIN_NAME" -n >/dev/null 2>&1; then
-            v6_chain=1
-        fi
-        if ip6t -C OUTPUT -j "$CHAIN_NAME" >/dev/null 2>&1; then
-            v6_jump=1
-        fi
+        ip6t -L "$CHAIN_NAME" -n >/dev/null 2>&1       && v6_chain=1
+        ip6t -C OUTPUT -j "$CHAIN_NAME" >/dev/null 2>&1 && v6_jump=1
     fi
 
     echo "chain_name=$CHAIN_NAME"
@@ -812,9 +731,24 @@ selftest_info() {
     echo "v6_output_jump_exists=$v6_jump"
 }
 
+# 清理相关的网络规则与锁文件以卸载当前组件所施加的影响
+do_uninstall() {
+    ipt -D OUTPUT -j "$CHAIN_NAME" 2>/dev/null
+    ipt -F "$CHAIN_NAME" 2>/dev/null
+    ipt -X "$CHAIN_NAME" 2>/dev/null
+    if [ "$_HAS_IP6TABLES" = "1" ]; then
+        ip6t -D OUTPUT -j "$CHAIN_NAME" 2>/dev/null
+        ip6t -F "$CHAIN_NAME" 2>/dev/null
+        ip6t -X "$CHAIN_NAME" 2>/dev/null
+    fi
+    rm -rf "$LOCKDIR" 2>/dev/null
+}
+
+# 初始化环境状态变量以确认底层防护墙所支持的功能
 init_iptables_mode
 init_ip6tables_mode
 
+# 用户主入口 解析并路由所有的网络维护指令
 case "$1" in
     add)
         shift
@@ -842,8 +776,11 @@ case "$1" in
     healthcheck)
         healthcheck_info
         ;;
+    uninstall)
+        run_with_lock do_uninstall
+        ;;
     *)
-        echo "Usage: $0 {add|del|restore|list|status|check|selftest|healthcheck}"
+        echo "Usage: $0 {add|del|restore|list|status|check|selftest|healthcheck|uninstall}"
         exit 1
         ;;
 esac

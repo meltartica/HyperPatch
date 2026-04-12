@@ -1,112 +1,76 @@
 #!/system/bin/sh
 
-SELF_PATH="$(readlink -f "$0" 2>/dev/null)"
-[ -n "$SELF_PATH" ] || SELF_PATH="$0"
-case "$SELF_PATH" in
-    /*) ;;
-    *) SELF_PATH="$(pwd)/$SELF_PATH" ;;
-esac
-SCRIPT_DIR=${SELF_PATH%/*}
-MODDIR=${SCRIPT_DIR%/*}
+SCRIPT_DIR="${0%/*}"
+MODDIR="${SCRIPT_DIR%/*}"
 CTL="${MODDIR}/bin/service_hider_ctl"
-CHAIN_NAME="SERVICE_HIDER"
-LOCKDIR="${MODDIR}/.service_hider_lock"
 WATCHER_PID_FILE="${MODDIR}/.shw.pid"
 RULES_FILE="${MODDIR}/rules.conf"
-IPTABLES_WAIT=0
-IPTABLES6_WAIT=0
 LOG_BASE="/data/adb/hyperpatch_logs"
 LOG_FILE="${LOG_BASE}/service_hider.log"
 
+# 在启动时缓存命令可用性状态 以免在运行时发生改变
+_HAS_STAT=0
+_HAS_CKSUM=0
+command -v stat  >/dev/null 2>&1 && _HAS_STAT=1
+command -v cksum >/dev/null 2>&1 && _HAS_CKSUM=1
+
+# 创建日志目录和文件
 mkdir_log() {
     mkdir -p "$LOG_BASE" 2>/dev/null
     touch "$LOG_FILE" 2>/dev/null
 }
 
+# 记录带有时间戳的消息到日志文件
 log_msg() {
-    ts="$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)"
-    [ -n "$ts" ] || ts="[no-time]"
-    printf '%s %s %s\n' "[$ts]" "[HyperPatch][ServiceHider]" "$1" >> "$LOG_FILE" 2>/dev/null
+    printf '%s [HyperPatch][ServiceHider] %s\n' \
+        "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo '[no-time]')" \
+        "$1" >> "$LOG_FILE" 2>/dev/null
 }
 
+# 检查日志文件大小 超过限制则进行轮换
 rotate_log() {
-    if [ ! -f "$LOG_FILE" ]; then
-        return 0
-    fi
-
-    size="$(wc -c < "$LOG_FILE" 2>/dev/null)"
-    [ -z "$size" ] && size=0
-
-    max_size=$((512 * 1024))
-    if [ "$size" -ge "$max_size" ]; then
-        # Native O(1) unix log rolling to keep exactly 2 backups natively without spawning heavy find/sort/xargs pipelines
+    [ -f "$LOG_FILE" ] || return 0
+    size=$(wc -c < "$LOG_FILE" 2>/dev/null); [ -z "$size" ] && size=0
+    if [ "$size" -ge $((512 * 1024)) ]; then
         mv -f "${LOG_FILE}.1" "${LOG_FILE}.2" 2>/dev/null
-        mv -f "$LOG_FILE" "${LOG_FILE}.1" 2>/dev/null
+        mv -f "$LOG_FILE"     "${LOG_FILE}.1" 2>/dev/null
     fi
 }
 
-init_iptables_mode() {
-    if iptables -w -L OUTPUT -n >/dev/null 2>&1; then
-        IPTABLES_WAIT=1
-    fi
-}
-
-ipt() {
-    if [ "$IPTABLES_WAIT" = "1" ]; then
-        iptables -w "$@"
-    else
-        iptables "$@"
-    fi
-}
-
-init_ip6tables_mode() {
-    if command -v ip6tables >/dev/null 2>&1 && ip6tables -w -L OUTPUT -n >/dev/null 2>&1; then
-        IPTABLES6_WAIT=1
-    fi
-}
-
-ip6t() {
-    if [ "$IPTABLES6_WAIT" = "1" ]; then
-        ip6tables -w "$@"
-    else
-        ip6tables "$@"
-    fi
-}
-
+# 轮询系统属性直到设备完成启动
 wait_for_boot() {
     until [ "$(getprop sys.boot_completed)" = "1" ]; do
         sleep 2
     done
 }
 
+# 调用控制脚本恢复所有网络规则
 restore_rules() {
     "${CTL}" restore >/dev/null 2>&1
 }
 
+# 计算文件的变动签名 支持 stat cksum 或文件大小
 file_signature() {
     target="$1"
     if [ ! -f "$target" ]; then
         echo "missing"
         return
     fi
-
-    # Fast O(1) attribute check - instead of heavily hashing a 5MB+ XML file
-    if command -v stat >/dev/null 2>&1; then
+    if [ "$_HAS_STAT" = "1" ]; then
         out="$(stat -c "%Y:%s" "$target" 2>/dev/null)"
         if [ -n "$out" ]; then
             echo "$out"
             return
         fi
     fi
-
-    if command -v cksum >/dev/null 2>&1; then
+    if [ "$_HAS_CKSUM" = "1" ]; then
         cksum "$target" 2>/dev/null | awk '{print $1":"$2}'
         return
     fi
-
     wc -c < "$target" 2>/dev/null | awk '{print "size:"$1}'
 }
 
+# 组合应用列表和配置文件的签名用于变化检测
 watch_state_signature() {
     sig_xml="$(file_signature /data/system/packages.xml)"
     sig_list="$(file_signature /data/system/packages.list)"
@@ -114,6 +78,7 @@ watch_state_signature() {
     echo "${sig_xml}|${sig_list}|${sig_rules}"
 }
 
+# 启动 inotifyd 监视相关配置文件的变化并在变动时触发规则恢复
 watch_package_changes() {
     if ! command -v inotifyd >/dev/null 2>&1; then
         echo "ServiceHider: inotifyd not found; package reload watcher disabled."
@@ -125,64 +90,80 @@ watch_package_changes() {
     restore_attempts=0
     watcher_restarts=0
 
+    _PKG_FIFO="${MODDIR}/.hp_pkg_events"
+    rm -f "$_PKG_FIFO" 2>/dev/null
+    mkfifo "$_PKG_FIFO" 2>/dev/null || {
+        log_msg "mkfifo failed; package watcher disabled"
+        return 1
+    }
+
     while true; do
         watch_specs=""
-        [ -e /data/system/packages.xml ] && watch_specs="${watch_specs} /data/system/packages.xml:cew0"
+        [ -e /data/system/packages.xml  ] && watch_specs="${watch_specs} /data/system/packages.xml:cew0"
         [ -e /data/system/packages.list ] && watch_specs="${watch_specs} /data/system/packages.list:cew0"
-        [ -e "$RULES_FILE" ] && watch_specs="${watch_specs} ${RULES_FILE}:cew0"
+        [ -e "$RULES_FILE"              ] && watch_specs="${watch_specs} ${RULES_FILE}:cew0"
         [ -z "$watch_specs" ] && [ -d /data/system ] && watch_specs=" /data/system:cew0"
-        [ -z "$watch_specs" ] && [ -d "$MODDIR" ] && watch_specs=" ${MODDIR}:cew0"
+        [ -z "$watch_specs" ] && [ -d "$MODDIR"     ] && watch_specs=" ${MODDIR}:cew0"
 
         if [ -z "$watch_specs" ]; then
             sleep 10
             continue
         fi
 
-        # Stream inotify events and restore rules only when package state signature changed.
         # shellcheck disable=SC2086
-        inotifyd - $watch_specs 2>/dev/null | while IFS= read -r _line; do
-                now="$(date +%s 2>/dev/null)"
-                [ -z "$now" ] && now=0
-                if [ $((now - last_restore)) -lt 2 ]; then
-                    continue
-                fi
+        inotifyd - $watch_specs > "$_PKG_FIFO" 2>/dev/null &
+        _INOTIFY_PID=$!
 
-                current_watch_state="$(watch_state_signature)"
-                if [ "$current_watch_state" = "$last_watch_state" ]; then
-                    continue
-                fi
+        while IFS= read -r _line; do
+            now="$(date +%s 2>/dev/null)"
+            [ -z "$now" ] && now=0
+            if [ $((now - last_restore)) -lt 2 ]; then
+                continue
+            fi
 
-                restore_attempts=$((restore_attempts + 1))
-                log_msg "restore attempt from watcher count=$restore_attempts"
-                sleep 1
-                if restore_rules; then
-                    log_msg "restore ok from watcher (attempt=$restore_attempts)"
-                else
-                    log_msg "restore failed from watcher (attempt=$restore_attempts)"
-                fi
-                last_restore="$now"
-                last_watch_state="$current_watch_state"
-        done
+            current_watch_state="$(watch_state_signature)"
+            if [ "$current_watch_state" = "$last_watch_state" ]; then
+                continue
+            fi
 
-        # Restart watcher when event stream exits (path changes/unwatchable state).
+            restore_attempts=$((restore_attempts + 1))
+            log_msg "restore attempt from watcher count=$restore_attempts"
+            sleep 1
+            if restore_rules; then
+                log_msg "restore ok from watcher (attempt=$restore_attempts)"
+            else
+                log_msg "restore failed from watcher (attempt=$restore_attempts)"
+            fi
+            last_restore="$now"
+            last_watch_state="$current_watch_state"
+        done < "$_PKG_FIFO"
+
+        kill "$_INOTIFY_PID" 2>/dev/null
+        wait "$_INOTIFY_PID" 2>/dev/null
+
         watcher_restarts=$((watcher_restarts + 1))
         log_msg "watcher restart count=$watcher_restarts"
         sleep 1
     done
+
+    rm -f "$_PKG_FIFO" 2>/dev/null
 }
 
+# 服务的早期启动入口 负责恢复规则并挂起监视进程
 run_service() {
     mkdir_log
     rotate_log
     log_msg "service hook entered"
-    if [ -f "$WATCHER_PID_FILE" ]; then
-        old_pid="$(cat "$WATCHER_PID_FILE" 2>/dev/null)"
-        if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
-            log_msg "watcher already running (pid=$old_pid)"
-            return 0
-        fi
-        rm -f "$WATCHER_PID_FILE" 2>/dev/null
+
+    read -r old_pid < "$WATCHER_PID_FILE" 2>/dev/null || old_pid=""
+    if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
+        log_msg "watcher already running (pid=$old_pid)"
+        return 0
     fi
+    rm -f "$WATCHER_PID_FILE" 2>/dev/null
+
+    # 导出缓存的可用性标志以便后台子 shell 继承它们
+    export _HAS_STAT _HAS_CKSUM
 
     (
         if [ "$SERVICE_HIDER_BOOT_READY" != "1" ]; then
@@ -201,46 +182,31 @@ run_service() {
     log_msg "watcher started (pid=$!)"
 }
 
-run_post_fs_data() {
-    return 0
-}
-
+# 在模块卸载时清理进程并恢复网络规则
 run_uninstall() {
     log_msg "uninstall hook entered"
-    if [ -f "$WATCHER_PID_FILE" ]; then
-        watcher_pid="$(cat "$WATCHER_PID_FILE" 2>/dev/null)"
-        if [ -n "$watcher_pid" ] && kill -0 "$watcher_pid" 2>/dev/null; then
-            log_msg "stopping watcher (pid=$watcher_pid)"
-            kill "$watcher_pid" 2>/dev/null
-        fi
-        rm -f "$WATCHER_PID_FILE" 2>/dev/null
-    fi
 
-    init_iptables_mode
-    init_ip6tables_mode
-    ipt -D OUTPUT -j "$CHAIN_NAME" 2>/dev/null
-    ipt -F "$CHAIN_NAME" 2>/dev/null
-    ipt -X "$CHAIN_NAME" 2>/dev/null
-    if command -v ip6tables >/dev/null 2>&1; then
-        ip6t -D OUTPUT -j "$CHAIN_NAME" 2>/dev/null
-        ip6t -F "$CHAIN_NAME" 2>/dev/null
-        ip6t -X "$CHAIN_NAME" 2>/dev/null
+    read -r watcher_pid < "$WATCHER_PID_FILE" 2>/dev/null || watcher_pid=""
+    if [ -n "$watcher_pid" ] && kill -0 "$watcher_pid" 2>/dev/null; then
+        log_msg "stopping watcher (pid=$watcher_pid)"
+        kill "$watcher_pid" 2>/dev/null
     fi
-    rm -rf "$LOCKDIR" 2>/dev/null
+    rm -f "$WATCHER_PID_FILE" 2>/dev/null
+
+    # 将链的卸载委托给 ctl 以避免重复编写 iptables 包装逻辑
+    "${CTL}" uninstall
 }
 
+# 主执行分支 解析外部参数执行特定的阶段指令
 case "$1" in
     service)
         run_service
-        ;;
-    post-fs-data)
-        run_post_fs_data
         ;;
     uninstall)
         run_uninstall
         ;;
     *)
-        echo "Usage: $0 {service|post-fs-data|uninstall}"
+        echo "Usage: $0 {service|uninstall}"
         exit 1
         ;;
 esac

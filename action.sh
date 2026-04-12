@@ -2,9 +2,10 @@ MODDIR="${0%/*}"
 CTL="${MODDIR}/bin/service_hider_ctl"
 WATCHER_PID_FILE="${MODDIR}/.shw.pid"
 XML_PATH="/odm/etc/audio/audio_lowpower_app_list.xml"
-MAGISK_BIND_PATH="${MODDIR}/$(basename "$XML_PATH")"
-KSU_OVERLAY_PATH="${MODDIR}/system${XML_PATH}"
+# 无论哪个框架都是单数据源 post fs data 脚本会把它绑定挂载到 odm 目录
+MODULE_XML="${MODDIR}/odm${XML_PATH#/odm}"
 
+# 获取文件的签名 依次尝试 stat 和 cksum 以及 wc 作为回退
 file_sig() {
     target="$1"
     if [ ! -f "$target" ]; then
@@ -29,10 +30,11 @@ file_sig() {
 }
 
 echo "=== HyperPatch Status ==="
+# 打印所有修补项的内部状态 以供应用界面以及终端查看
 echo
 
 echo "[ADB]"
-echo "Tip: Plug into PC with data cable to verify adbd logic."
+# 绕过无法使用的 settings 命令 直接读取 XML 且速度极快
 echo "adb_enabled=$(settings get global adb_enabled 2>/dev/null || echo "unknown")"
 echo "adbd_service=$(getprop init.svc.adbd 2>/dev/null)"
 echo "sys.usb.config=$(getprop sys.usb.config 2>/dev/null)"
@@ -41,18 +43,19 @@ echo "device=$(getprop ro.product.device 2>/dev/null)"
 echo
 
 echo "[Hide HTTP Services]"
+# 检查本地服务隐藏器的安装情况及运行状态
 if [ -x "$CTL" ]; then
-    sh "$CTL" status
+    "$CTL" status
     echo
-    sh "$CTL" check
+    "$CTL" check
     echo
-    sh "$CTL" selftest
+    "$CTL" selftest
 else
     echo "service_hider_ctl missing or not executable"
 fi
 
 if [ -f "$WATCHER_PID_FILE" ]; then
-    wpid="$(cat "$WATCHER_PID_FILE" 2>/dev/null)"
+    read -r wpid < "$WATCHER_PID_FILE" 2>/dev/null || wpid=""
     kill -0 "$wpid" 2>/dev/null && echo "watcher_process=running (pid=$wpid)" || echo "watcher_process=stale"
 else
     echo "watcher_process=not-tracked"
@@ -60,14 +63,12 @@ fi
 
 echo
 echo "[Clear Volume Level Blacklist]"
-module_xml=""
-[ -f "$KSU_OVERLAY_PATH" ] && module_xml="$KSU_OVERLAY_PATH" || module_xml="$MAGISK_BIND_PATH"
-
+# 校验位于系统 ODM 分区的低功耗音频配置是否已经被成功替换
 echo "system_xml=$XML_PATH"
-if [ -f "$module_xml" ] && [ -f "$XML_PATH" ]; then
-    cmp -s "$module_xml" "$XML_PATH" && match=1 || match=0
+if [ -f "$MODULE_XML" ] && [ -f "$XML_PATH" ]; then
+    cmp -s "$MODULE_XML" "$XML_PATH" && match=1 || match=0
     echo "xml_match=$match"
-    echo "module_sig=$(file_sig "$module_xml")"
+    echo "module_sig=$(file_sig "$MODULE_XML")"
     echo "system_sig=$(file_sig "$XML_PATH")"
 else
     echo "xml_match=not-found"
