@@ -4,7 +4,6 @@ SCRIPT_DIR="${0%/*}"
 MODDIR="${SCRIPT_DIR%/*}"
 CONFIG=${MODDIR}/rules.conf
 CHAIN_NAME="SERVICE_HIDER"
-WATCHER_PID_FILE="${MODDIR}/.shw.pid"
 UID_MAP=""
 LOCKDIR="${MODDIR}/.service_hider_lock"
 IPTABLES_WAIT=0
@@ -677,7 +676,7 @@ check_rules() {
 
 # 提供快速只读的布尔值结果 检查整个组件依赖和链的健康状态
 healthcheck_info() {
-    config_ok=0; v4_ok=0; v6_ok=0; watcher_ok=0; lock_ok=0
+    config_ok=0; v4_ok=0; v6_ok=0; lock_ok=0
 
     [ -f "$CONFIG" ] && [ -r "$CONFIG" ] && config_ok=1
 
@@ -693,21 +692,15 @@ healthcheck_info() {
         v6_ok=1
     fi
 
-    if [ -f "$WATCHER_PID_FILE" ]; then
-        read -r watcher_pid < "$WATCHER_PID_FILE" 2>/dev/null || watcher_pid=""
-        [ -n "$watcher_pid" ] && kill -0 "$watcher_pid" 2>/dev/null && watcher_ok=1
-    fi
-
     [ ! -d "$LOCKDIR" ] && lock_ok=1
 
     echo "config_ok=$config_ok"
     echo "v4_chain_ok=$v4_ok"
     echo "v6_chain_ok=$v6_ok"
-    echo "watcher_ok=$watcher_ok"
     echo "lock_ok=$lock_ok"
 
     [ "$config_ok" -eq 1 ] && [ "$v4_ok" -eq 1 ] && [ "$v6_ok" -eq 1 ] && \
-        [ "$watcher_ok" -eq 1 ] && [ "$lock_ok" -eq 1 ]
+        [ "$lock_ok" -eq 1 ]
 }
 
 # 打印底层网络包过滤链本身的连通性和独立健康状况

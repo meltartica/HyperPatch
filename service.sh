@@ -6,33 +6,37 @@ until [ "$(getprop sys.boot_completed)" = "1" ]; do
     sleep 10
 done
 
-# 如果系统隐藏服务脚本存在 则通知该模块开始初始化服务
+# 开机后执行一次 ServiceHider 规则恢复 不保留后台监视进程
 if [ -x "${MODDIR}/bin/service_hider_lifecycle" ]; then
     SERVICE_HIDER_BOOT_READY=1 "${MODDIR}/bin/service_hider_lifecycle" service
 fi
 
 # 当 UDC 报告 USB 数据主机已连接时返回 0
 get_usb_connected() {
-    for state_file in /sys/class/udc/*/state; do
-        [ -f "$state_file" ] || continue
-        state_val="$(cat "$state_file" 2>/dev/null)"
+    [ -f "$CANON_UDC_STATE" ] || return 1
+
+    if IFS= read -r state_val < "$CANON_UDC_STATE"; then
         case "$state_val" in
             configured|addressed|connected)
                 return 0
                 ;;
         esac
-    done
+    fi
+
     return 1
 }
 
-# 为所有 UDC 状态文件构建以空格分隔的 file:cew0 监视规范列表
-collect_udc_state_files() {
-    UDC_STATE_FILES=""
+# 解析单个规范 UDC 状态文件用于事件监听与状态读取
+resolve_canonical_udc_state() {
+    CANON_UDC_STATE=""
     for state_file in /sys/class/udc/*/state; do
-        [ -f "$state_file" ] || continue
-        UDC_STATE_FILES="${UDC_STATE_FILES} ${state_file}"
+        if [ -f "$state_file" ]; then
+            CANON_UDC_STATE="$state_file"
+            break
+        fi
     done
-    [ -n "$UDC_STATE_FILES" ]
+
+    [ -n "$CANON_UDC_STATE" ]
 }
 
 # 更改全局 ADB 状态并重启 adbd 服务以应用新配置
@@ -55,8 +59,6 @@ set_adb_state() {
 
         if [ "$adbd_state" != "running" ]; then
             setprop ctl.start adbd
-        elif [ "$config_changed" = "1" ]; then
-            setprop ctl.restart adbd
         fi
 
         last_adb_state="1"
@@ -68,7 +70,7 @@ set_adb_state() {
             # 安全地剥离 adb 以保留现有的网络共享或 MIDI 模式
             new_config="$(printf '%s' "$sys_usb_config" | sed 's/,adb//; s/adb,//; s/adb/mtp/')"
             [ -z "$new_config" ] && new_config="mtp"
-            
+
             setprop persist.sys.usb.config "$new_config"
             setprop sys.usb.config "$new_config"
         fi
@@ -91,6 +93,15 @@ reconcile_state() {
     fi
 
     [ "$usb_state" = "$last_usb_state" ] && return
+
+    # USB 状态在插拔瞬间可能抖动，二次确认后再执行切换
+    sleep 1
+    if get_usb_connected; then
+        confirmed_usb_state=1
+    else
+        confirmed_usb_state=0
+    fi
+    [ "$confirmed_usb_state" = "$usb_state" ] || return
 
     current="$(settings get global adb_enabled 2>/dev/null)"
     adbd_state="$(getprop init.svc.adbd 2>/dev/null)"
@@ -122,38 +133,32 @@ reconcile_state() {
 
 # 启动 inotifyd 事件循环监听 USB 状态变化
 event_loop_inotifyd() {
+    if ! resolve_canonical_udc_state; then
+        echo "Auto-ADB: no UDC state file found; watcher disabled."
+        return
+    fi
+
     reconcile_state
 
     while true; do
-        if ! collect_udc_state_files; then
+        inotifyd - "${CANON_UDC_STATE}:cew0" 2>/dev/null | while IFS= read -r _line; do
             sleep 2
-            continue
+            reconcile_state
+        done
+
+        # 仅当 inotifyd 退出时才重启，避免健康状态下的周期性唤醒
+        sleep 2
+
+        # UDC 节点可能在极少数场景重建，退出后重新解析一次
+        if ! resolve_canonical_udc_state; then
+            echo "Auto-ADB: UDC state file disappeared; watcher disabled."
+            return
         fi
-
-        watch_specs=""
-        for state_file in $UDC_STATE_FILES; do
-            watch_specs="${watch_specs} ${state_file}:cew0"
-        done
-
-        # shellcheck disable=SC2086
-        inotifyd - $watch_specs 2>/dev/null | while IFS= read -r _line; do
-            if get_usb_connected; then
-                current_usb=1
-            else
-                current_usb=0
-            fi
-
-            if [ "$current_usb" != "$last_usb_state" ]; then
-                sleep 2
-                reconcile_state
-            fi
-        done
-
-        sleep 1
     done
 }
 
 # 追踪最后观察到的 USB 状态以避免不必要的工作
+CANON_UDC_STATE=""
 last_usb_state="-1"
 last_adb_state="$(settings get global adb_enabled 2>/dev/null)"
 

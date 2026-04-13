@@ -1,9 +1,8 @@
 MODDIR="${0%/*}"
 CTL="${MODDIR}/bin/service_hider_ctl"
-WATCHER_PID_FILE="${MODDIR}/.shw.pid"
 XML_PATH="/odm/etc/audio/audio_lowpower_app_list.xml"
-# 无论哪个框架都是单数据源 post fs data 脚本会把它绑定挂载到 odm 目录
-MODULE_XML="${MODDIR}/odm${XML_PATH#/odm}"
+# 模块内直接采用 odm 路径作为单一数据源
+MODULE_XML="${MODDIR}${XML_PATH}"
 
 # 获取文件的签名 依次尝试 stat 和 cksum 以及 wc 作为回退
 file_sig() {
@@ -45,6 +44,14 @@ echo
 echo "[Hide HTTP Services]"
 # 检查本地服务隐藏器的安装情况及运行状态
 if [ -x "$CTL" ]; then
+    echo "applying_rules=running"
+    if "$CTL" restore >/dev/null 2>&1; then
+        echo "applying_rules=ok"
+    else
+        echo "applying_rules=failed"
+    fi
+    echo
+
     "$CTL" status
     echo
     "$CTL" check
@@ -52,13 +59,6 @@ if [ -x "$CTL" ]; then
     "$CTL" selftest
 else
     echo "service_hider_ctl missing or not executable"
-fi
-
-if [ -f "$WATCHER_PID_FILE" ]; then
-    read -r wpid < "$WATCHER_PID_FILE" 2>/dev/null || wpid=""
-    kill -0 "$wpid" 2>/dev/null && echo "watcher_process=running (pid=$wpid)" || echo "watcher_process=stale"
-else
-    echo "watcher_process=not-tracked"
 fi
 
 echo
