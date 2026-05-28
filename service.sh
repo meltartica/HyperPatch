@@ -6,10 +6,12 @@ until [ "$(getprop sys.boot_completed)" = "1" ]; do
     sleep 10
 done
 
-# 开机后执行一次 ServiceHider 规则恢复 不保留后台监视进程
-if [ -x "${MODDIR}/bin/service_hider_lifecycle" ]; then
-    SERVICE_HIDER_BOOT_READY=1 "${MODDIR}/bin/service_hider_lifecycle" service
-fi
+# 开机 60 秒后强制停止小米互联通信服务，以避免 NFC 超时导致贴贴分享不可用
+kill_mi_connect_service() {
+    sleep 60
+    am force-stop "com.xiaomi.mi_connect_service" >/dev/null 2>&1
+}
+kill_mi_connect_service &
 
 # 当 UDC 报告 USB 数据主机已连接时返回 0
 get_usb_connected() {
@@ -53,12 +55,16 @@ set_adb_state() {
                 new_config="mtp,adb"
             fi
             setprop persist.sys.usb.config "$new_config"
+            setprop sys.usb.config none
+            sleep 0.5
             setprop sys.usb.config "$new_config"
             config_changed=1
         fi
 
         if [ "$adbd_state" != "running" ]; then
             setprop ctl.start adbd
+        elif [ "$config_changed" = "1" ]; then
+            setprop ctl.restart adbd
         fi
 
         last_adb_state="1"
