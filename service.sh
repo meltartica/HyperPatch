@@ -43,27 +43,12 @@ resolve_canonical_udc_state() {
 
 # 更改全局 ADB 状态并重启 adbd 服务以应用新配置
 set_adb_state() {
-    # 期望预填 current adbd_state sys_usb_config
     if [ "$1" = "1" ]; then
         [ "$current" = "1" ] || settings put global adb_enabled 1
 
-        config_changed=0
-        if ! printf '%s' "$sys_usb_config" | grep -q 'adb'; then
-            if [ -n "$sys_usb_config" ] && [ "$sys_usb_config" != "none" ]; then
-                new_config="${sys_usb_config},adb"
-            else
-                new_config="mtp,adb"
-            fi
-            setprop persist.sys.usb.config "$new_config"
-            setprop sys.usb.config none
-            sleep 0.5
-            setprop sys.usb.config "$new_config"
-            config_changed=1
-        fi
-
         if [ "$adbd_state" != "running" ]; then
             setprop ctl.start adbd
-        elif [ "$config_changed" = "1" ]; then
+        else
             setprop ctl.restart adbd
         fi
 
@@ -71,15 +56,6 @@ set_adb_state() {
         echo "Auto-ADB: PC Connected, enabling..."
     else
         [ "$current" = "0" ] || settings put global adb_enabled 0
-
-        if printf '%s' "$sys_usb_config" | grep -q 'adb'; then
-            # 安全地剥离 adb 以保留现有的网络共享或 MIDI 模式
-            new_config="$(printf '%s' "$sys_usb_config" | sed 's/,adb//; s/adb,//; s/adb/mtp/')"
-            [ -z "$new_config" ] && new_config="mtp"
-
-            setprop persist.sys.usb.config "$new_config"
-            setprop sys.usb.config "$new_config"
-        fi
 
         [ "$adbd_state" = "stopped" ] || setprop ctl.stop adbd
 
@@ -90,6 +66,12 @@ set_adb_state() {
 
 # 仅在 USB 连接状态改变时应用预期的 ADB 状态
 reconcile_state() {
+    # 切换 ADB 状态会触发 USB 重新枚举，枚举期间 UDC 状态会抖动
+    # 在冷却期内跳过处理，避免启用→禁用→启用的乒乓循环
+    now_epoch=$(date +%s 2>/dev/null || cat /proc/uptime | cut -d' ' -f1 | cut -d'.' -f1)
+    elapsed=$(( now_epoch - last_switch_epoch ))
+    [ "$elapsed" -lt 8 ] 2>/dev/null && return
+
     if get_usb_connected; then
         usb_state=1
         desired=1
@@ -111,15 +93,14 @@ reconcile_state() {
 
     current="$(settings get global adb_enabled 2>/dev/null)"
     adbd_state="$(getprop init.svc.adbd 2>/dev/null)"
-    sys_usb_config="$(getprop sys.usb.config 2>/dev/null)"
 
     runtime_ok=0
     if [ "$desired" = "1" ]; then
-        if [ "$current" = "1" ] && [ "$adbd_state" = "running" ] && printf '%s' "$sys_usb_config" | grep -q 'adb'; then
+        if [ "$current" = "1" ] && [ "$adbd_state" = "running" ]; then
             runtime_ok=1
         fi
     else
-        if [ "$current" = "0" ] && [ "$adbd_state" = "stopped" ] && ! printf '%s' "$sys_usb_config" | grep -q 'adb'; then
+        if [ "$current" = "0" ] && [ "$adbd_state" = "stopped" ]; then
             runtime_ok=1
         fi
     fi
@@ -131,6 +112,7 @@ reconcile_state() {
     fi
 
     if [ "$last_adb_state" != "$desired" ] || [ "$current" != "$desired" ]; then
+        last_switch_epoch=$(date +%s 2>/dev/null || cat /proc/uptime | cut -d' ' -f1 | cut -d'.' -f1)
         set_adb_state "$desired"
     fi
 
@@ -167,6 +149,8 @@ event_loop_inotifyd() {
 CANON_UDC_STATE=""
 last_usb_state="-1"
 last_adb_state="$(settings get global adb_enabled 2>/dev/null)"
+# 上次切换 ADB 状态的时间戳，用于在 USB 重新枚举期间忽略抖动
+last_switch_epoch=0
 
 # 检测系统对文件事件监听的支持程度 若完整支持则进入主循环分支 否则提示不可用
 if command -v inotifyd >/dev/null 2>&1; then
