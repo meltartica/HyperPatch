@@ -7,6 +7,10 @@ fi
 ui_print "- 正在应用 Rescue Party Plus 补丁..."
 ui_print "- 正在应用基于连接状态自动切换 ADB..."
 ui_print "- 正在应用开机自动杀死小米互联服务..."
+ui_print "- 正在应用强制启用 AOD 的 1Hz 刷新率（需要搭配全屏 AOD 使用)..."
+ui_print "- 正在应用清空音量黑名单列表..."
+ui_print "- 正在应用停用刷新率切换的亮度..."
+ui_print "- 正在应用开机自动清除 OEM 解锁允许属性..."
 
 ui_print "- 正在设置脚本权限..."
 

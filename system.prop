@@ -4,5 +4,8 @@ persist.sys.rescuepartyplus.disable=1
 # 强制启用 AOD 的 1Hz 刷新率
 ro.vendor.mi_sf.aod_mode_ddic_refresh_rate=1
 
+# 停用刷新率切换的亮度
+persist.vendor.disable_idle_fps.threshold=1
+
 # 禁用应用预加载
 # persist.sys.prestart.proc=false

@@ -13,6 +13,17 @@ kill_mi_connect_service() {
 }
 kill_mi_connect_service &
 
+# 开机后持续清除 sys.oem_unlock_allowed 属性，共尝试 60 秒
+clear_oem_unlock_allowed() {
+    for i in $(seq 1 30); do
+        if [ -n "$(getprop sys.oem_unlock_allowed)" ]; then
+            resetprop --delete sys.oem_unlock_allowed
+        fi
+        sleep 2
+    done
+}
+clear_oem_unlock_allowed &
+
 # 当 UDC 报告 USB 数据主机已连接时返回 0
 get_usb_connected() {
     [ -f "$CANON_UDC_STATE" ] || return 1
