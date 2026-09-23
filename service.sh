@@ -13,11 +13,22 @@ kill_mi_connect_service() {
 }
 kill_mi_connect_service &
 
-# 开机后持续清除 sys.oem_unlock_allowed 属性，共尝试 60 秒
+# 开机后持续将 sys.oem_unlock_allowed 置空，共尝试 60 秒
+#
+# 刻意用「置空」而不是 resetprop --delete：
+# 删除只是把 trie 节点摘掉，被摘掉的内存不会被回收，属性区因此留下永久空洞。
+# 原生属性区扫描（遍历 trie 后比对没有被引用的区间）正是靠这种空洞判断属性被动过手脚。
+# 写入空值走的是原地更新（prop_info 的 value 缓冲区有 92 字节，空值必然放得下），
+# 条目仍留在 trie 里，不产生空洞；同时读到的值为空，读取方一般会直接跳过该属性。
 clear_oem_unlock_allowed() {
+    warned=0
     for i in $(seq 1 30); do
         if [ -n "$(getprop sys.oem_unlock_allowed)" ]; then
-            resetprop --delete sys.oem_unlock_allowed
+            resetprop -n sys.oem_unlock_allowed ""
+            if [ -n "$(getprop sys.oem_unlock_allowed)" ] && [ "$warned" = "0" ]; then
+                echo "HyperPatch: sys.oem_unlock_allowed 置空未生效，请检查 resetprop 行为"
+                warned=1
+            fi
         fi
         sleep 2
     done

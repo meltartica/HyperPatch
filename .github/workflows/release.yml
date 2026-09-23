@@ -1,0 +1,95 @@
+name: Release
+
+# Release by pushing a tag:
+#
+#   git tag v2026.9.24
+#   git push origin v2026.9.24
+#
+# This replaces build.ps1. It stamps module.prop from the tag, builds the ZIP,
+# publishes the release, then commits update.json back to main - update.json is
+# the file the manager's update button actually reads, and it has to live at a
+# stable URL.
+#
+# No third-party actions, one job, four steps.
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The repo is tiny; a full fetch keeps the later push to main simple.
+          fetch-depth: 0
+
+      - name: Stamp and build
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          REPO="${GITHUB_REPOSITORY}"
+
+          # v2026.9.24 -> 20260924. The manager compares versionCode, not the
+          # version string, so this must move or no update is ever offered.
+          IFS=. read -r Y M D <<< "${TAG#v}"
+          VC="$(printf '%04d%02d%02d' "$Y" "$M" "$D")"
+
+          sed -i "s|^version=.*|version=${TAG}|" module.prop
+          sed -i "s|^versionCode=.*|versionCode=${VC}|" module.prop
+
+          URL="https://github.com/${REPO}/raw/main/update.json"
+          if grep -q '^updateJson=' module.prop; then
+            sed -i "s|^updateJson=.*|updateJson=${URL}|" module.prop
+          else
+            printf 'updateJson=%s\n' "$URL" >> module.prop
+          fi
+
+          # zipUrl is CONSTANT across releases on purpose. GitHub serves
+          # releases/latest/download/<asset> as a permanent link to the newest
+          # release's asset, but it can only be permanent if the asset NAME is
+          # permanent - hence HyperPatch.zip rather than HyperPatch-<tag>.zip.
+          # The release tag still labels it on the release page.
+          #
+          # versionCode is the part that cannot be dynamic: the manager compares
+          # it against the installed value, so update.json must be recommitted
+          # for each release or no update is ever offered.
+          printf '{\n  "version": "%s",\n  "versionCode": %s,\n  "zipUrl": "%s",\n  "changelog": "%s"\n}\n' \
+            "$TAG" "$VC" \
+            "https://github.com/${REPO}/releases/latest/download/HyperPatch.zip" \
+            "https://github.com/${REPO}/raw/main/CHANGELOG.md" > update.json
+
+          cat module.prop
+          cat update.json
+
+          # Nothing to normalise here: on Linux the checkout is already LF, and
+          # .gitattributes pins *.sh and *.prop to eol=lf. That is the whole
+          # reason this job is shorter than the PowerShell version it replaces.
+          mkdir -p dist
+          zip -r -X dist/HyperPatch.zip . \
+            -x '.git/*' '.github/*' 'dist/*' 'update.json' 'CHANGELOG.md' '.gitattributes' '.gitignore'
+          unzip -l dist/HyperPatch.zip
+          unzip -l dist/HyperPatch.zip | grep -q ' module\.prop$'
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release create "${GITHUB_REF_NAME}" dist/HyperPatch.zip \
+            --title "${GITHUB_REF_NAME}" \
+            --notes-file CHANGELOG.md \
+            --verify-tag
+
+      - name: Commit update.json to main
+        run: |
+          set -euo pipefail
+          git config user.name  'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add module.prop update.json
+          git diff --cached --quiet || git commit -m "chore: release ${GITHUB_REF_NAME}"
+          git push origin HEAD:main

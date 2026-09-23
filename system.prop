@@ -9,3 +9,9 @@ persist.vendor.disable_idle_fps.threshold=1
 
 # 禁用应用预加载
 # persist.sys.prestart.proc=false
+
+# 开启相机新版徕卡UI, 徕卡一瞬和实况运镜为UI
+ro.theme_customize=LCC
+ro.boot.product.theme_customize =P1_Leica
+ro.leica.camera=true
+ro.product.essential.support=1
