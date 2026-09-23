@@ -80,9 +80,27 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+
+          # Notes are only this tag's section, not the whole file. The workflow
+          # cannot write them, so a tag with no matching "## <tag>" heading is a
+          # mistake worth stopping for - publishing every version's history by
+          # accident is worse than a red run.
+          awk -v tag="${GITHUB_REF_NAME}" '
+            $0 == "## " tag { found = 1; next }
+            found && (/^## / || $0 == "---") { exit }
+            found { print }
+          ' CHANGELOG.md > "${RUNNER_TEMP}/release-notes.md"
+
+          if ! grep -q '[^[:space:]]' "${RUNNER_TEMP}/release-notes.md"; then
+            echo "::error::CHANGELOG.md has no '## ${GITHUB_REF_NAME}' section."
+            echo "Add it, push to main, then re-tag."
+            exit 1
+          fi
+
+          cat "${RUNNER_TEMP}/release-notes.md"
           gh release create "${GITHUB_REF_NAME}" dist/HyperPatch.zip \
             --title "${GITHUB_REF_NAME}" \
-            --notes-file CHANGELOG.md \
+            --notes-file "${RUNNER_TEMP}/release-notes.md" \
             --verify-tag
 
       - name: Commit update.json to main
