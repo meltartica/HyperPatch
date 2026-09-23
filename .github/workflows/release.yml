@@ -66,14 +66,11 @@ jobs:
           cat module.prop
           cat update.json
 
-          # Nothing to normalise here: on Linux the checkout is already LF, and
-          # .gitattributes pins *.sh and *.prop to eol=lf. That is the whole
-          # reason this job is shorter than the PowerShell version it replaces.
-          mkdir -p dist
-          zip -r -X dist/HyperPatch.zip . \
-            -x '.git/*' '.github/*' 'dist/*' 'update.json' 'CHANGELOG.md' '.gitattributes' '.gitignore'
-          unzip -l dist/HyperPatch.zip
-          unzip -l dist/HyperPatch.zip | grep -q ' module\.prop$'
+          # Packaging lives in tools/package.sh so this job and build.yml cannot
+          # disagree about what ships. Nothing to normalise first: on Linux the
+          # checkout is already LF, and .gitattributes pins *.sh and *.prop to
+          # eol=lf.
+          sh tools/package.sh
 
       - name: Publish release
         env:

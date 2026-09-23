@@ -28,13 +28,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Build module ZIP
-        run: |
-          set -euo pipefail
-          mkdir -p dist
-          zip -r -X dist/HyperPatch.zip . \
-            -x '.git/*' '.github/*' 'dist/*' 'update.json' 'CHANGELOG.md' '.gitattributes' '.gitignore'
-          unzip -l dist/HyperPatch.zip
-          unzip -l dist/HyperPatch.zip | grep -q ' module\.prop$'
+        run: sh tools/package.sh
 
       - uses: actions/upload-artifact@v4
         with:
